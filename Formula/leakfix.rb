@@ -1,8 +1,8 @@
 class Leakfix < Formula
   desc "One-stop CLI tool to detect, remove and prevent secrets in git repositories"
   homepage "https://github.com/princebharti/leakfix"
-  url "https://github.com/princebharti/leakfix/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "aba2c7c1bb2e9fd616769eed58d1d8a8ef563907a3417a641235ac88099c4bb0"
+  url "https://github.com/princebharti/leakfix/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "1fd8cbd5fbd32ca905b83ca04e6393fb3da1fd1cace213ce50f6a2c0605f380c"
   license "MIT"
 
   depends_on "python@3.11"
