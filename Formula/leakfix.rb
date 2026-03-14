@@ -108,8 +108,8 @@ class Leakfix < Formula
   end
 
   resource "pillow" do
-    url "https://files.pythonhosted.org/packages/cd/74/ad3d526fc4c9aa960845f56a5360f5e5acb6f9b6b8d9e942f9b40c27bf7/pillow-10.4.0.tar.gz"
-    sha256 "166c1cd4d24309b30d61f79f4a9114b7b2313d7450912fed6f4ae126c73f8a40"
+    url "https://files.pythonhosted.org/packages/cd/74/ad3d526f3bf7b6d3f408b73fde271ec69dfac8b81341a318ce825f2b3812/pillow-10.4.0.tar.gz"
+    sha256 "166c1cd4d24309b30d61f79f4a9114b7b2313d7450912277855ff5dfd7cd4a06"
   end
 
   resource "pycparser" do
