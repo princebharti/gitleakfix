@@ -8,9 +8,15 @@ class Leakfix < Formula
   license "MIT"
   head "https://github.com/princebharti/leakfix.git", branch: "main"
 
-  depends_on "git-filter-repo"
-  depends_on "gitleaks"
   depends_on "python@3.12"
+  depends_on "gitleaks"
+  depends_on "git-filter-repo"
+  depends_on "jpeg-turbo"
+  depends_on "libpng"
+  depends_on "libtiff"
+  depends_on "little-cms2"
+  depends_on "openjpeg"
+  depends_on "webp"
 
   resource "annotated-types" do
     url "https://files.pythonhosted.org/packages/ee/67/531ea369ba64dcff5ec9c3402f9f51bf748cec26dde048a2f973a4eea7f5/annotated_types-0.7.0.tar.gz"
