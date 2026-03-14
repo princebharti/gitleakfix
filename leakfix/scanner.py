@@ -86,12 +86,53 @@ class Scanner:
     def __init__(self, source: Path | str | None = None):
         self.source = Path(source or ".").resolve()
         self.repo_root = get_repo_root(self.source) or self.source
+        self._skipped_untracked: list[Finding] = []
+        self._untracked_files_warned: set[str] = set()
 
-    def scan_working_directory(self) -> list[Finding]:
-        """Scan all files on disk (working directory)."""
+    def get_tracked_files(self) -> set[str]:
+        """Return set of relative paths tracked by git (via git ls-files)."""
+        try:
+            result = subprocess.run(
+                ["git", "ls-files"],
+                capture_output=True,
+                text=True,
+                cwd=str(self.repo_root),
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return set()
+            return {
+                line.strip().replace("\\", "/")
+                for line in result.stdout.splitlines()
+                if line.strip()
+            }
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            return set()
+
+    def scan_working_directory(self, include_untracked: bool = False) -> list[Finding]:
+        """Scan files on disk. By default only scans git-tracked files."""
         findings: list[Finding] = []
         findings.extend(self._run_gitleaks(["detect", "--no-git"]))
-        return self._dedupe_findings(self._filter_ignored(findings))
+        findings = self._dedupe_findings(self._filter_ignored(findings))
+
+        if include_untracked:
+            return findings
+
+        tracked = self.get_tracked_files()
+        if not tracked:
+            return findings
+
+        passed: list[Finding] = []
+        skipped: list[Finding] = []
+        for f in findings:
+            if f.file in tracked:
+                passed.append(f)
+            else:
+                skipped.append(f)
+
+        self._skipped_untracked.extend(skipped)
+        self._untracked_files_warned.update(f.file for f in skipped)
+        return passed
 
     def scan_staged(self) -> list[Finding]:
         """Scan only staged files (for pre-commit hook)."""
@@ -103,9 +144,9 @@ class Scanner:
         findings = self._run_gitleaks(["detect"])
         return self._filter_ignored(findings)
 
-    def scan_all(self) -> list[Finding]:
+    def scan_all(self, include_untracked: bool = False) -> list[Finding]:
         """Scan both working directory and git history."""
-        findings = self.scan_working_directory() + self.scan_history()
+        findings = self.scan_working_directory(include_untracked=include_untracked) + self.scan_history()
         return self._dedupe_findings(findings)
 
     def _get_gitleaks_config_path(self) -> Path | None:

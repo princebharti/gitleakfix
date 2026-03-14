@@ -152,19 +152,27 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
     if confirmed:
         console.print(f"\nCONFIRMED SECRETS ({len(confirmed)}):")
         for c in confirmed:
-            if "LLM classified" in c.reason:
-                console.print(f"🤖 LLM classified: {c.finding.file}:{c.finding.line} → CONFIRMED")
+            masked = _mask_for_smart_display(c.finding.secret_value)
+            if "LLM (context-aware):" in c.reason:
+                console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
+                console.print(f"  🤖 {c.reason}")
+            elif "LLM classified" in c.reason:
+                console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
+                console.print(f"  🤖 {c.reason}")
             else:
-                masked = _mask_for_smart_display(c.finding.secret_value)
                 console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
 
     if false_positives:
         console.print(f"\nLIKELY FALSE POSITIVES ({len(false_positives)}) — skipped:")
         for c in false_positives:
-            if "LLM classified" in c.reason:
+            if "LLM (context-aware):" in c.reason:
+                console.print(f"⚪ {c.finding.file}:{c.finding.line} — {c.finding.rule_id}")
+                console.print(f"  🤖 {c.reason}")
+            elif "LLM classified" in c.reason:
                 console.print(
-                    f"🤖 LLM classified: {c.finding.file}:{c.finding.line} → {_llm_display_name(c.classification)}"
+                    f"⚪ {c.finding.file}:{c.finding.line} — {c.finding.rule_id}"
                 )
+                console.print(f"  🤖 {c.reason}")
             else:
                 console.print(f"⚪ {c.finding.file}:{c.finding.line} — {c.reason}")
 
@@ -350,6 +358,11 @@ def _format_hook_mode(findings: list[Finding], dangerous_files: list[str], path:
     is_flag=True,
     help="Use LLM to classify REVIEW_NEEDED findings (requires ollama).",
 )
+@click.option(
+    "--include-untracked",
+    is_flag=True,
+    help="Include untracked/gitignored files in scan.",
+)
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def scan(
     path: Path,
@@ -361,6 +374,7 @@ def scan(
     severity: str | None,
     smart: bool,
     llm: bool,
+    include_untracked: bool,
 ):
     """Scan repository for leaked secrets."""
     if not check_gitleaks_installed():
@@ -377,11 +391,18 @@ def scan(
     if staged or hook_mode:
         findings = scanner.scan_staged()
     elif scan_all_flag:
-        findings = scanner.scan_all()
+        working = scanner.scan_working_directory(include_untracked=include_untracked)
+        history_findings = scanner.scan_history()
+        findings = scanner._dedupe_findings(working + history_findings)
     elif history:
         findings = scanner.scan_history()
     else:
-        findings = scanner.scan_working_directory()
+        findings = scanner.scan_working_directory(include_untracked=include_untracked)
+
+    # Show warnings for skipped untracked files
+    if scanner._untracked_files_warned and not include_untracked:
+        for f in sorted(scanner._untracked_files_warned):
+            console.print(f"[dim]⚠️  Skipped {f} (not tracked by git — safe to keep secrets here)[/dim]")
 
     findings = _filter_by_severity(findings, severity)
 
@@ -513,6 +534,11 @@ def scan(
     is_flag=True,
     help="Use LLM to classify REVIEW_NEEDED findings (requires ollama).",
 )
+@click.option(
+    "--include-untracked",
+    is_flag=True,
+    help="Also scan and fix untracked files (files not in git). Use with caution.",
+)
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def fix(
     path: Path,
@@ -524,6 +550,7 @@ def fix(
     confirm: bool,
     include_review: bool,
     llm: bool,
+    include_untracked: bool,
 ):
     """Fix/remove detected secrets in working files and git history."""
     if not check_gitleaks_installed():
@@ -564,6 +591,7 @@ def fix(
         confirm=confirm,
         include_review=include_review,
         llm_enabled=llm_enabled,
+        include_untracked=include_untracked,
     )
 
     if success:

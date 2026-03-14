@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -15,19 +16,22 @@ from leakfix.scanner import Finding
 _LEAKFIX_HOME = Path.home() / ".leakfix"
 _LEAKFIX_LOG = _LEAKFIX_HOME / "leakfix.log"
 _logger: logging.Logger | None = None
+_logger_lock = threading.Lock()
 
 
 def _get_logger() -> logging.Logger:
-    """Get or create logger for leakfix."""
+    """Get or create logger for leakfix. Thread-safe with double-checked locking."""
     global _logger
     if _logger is None:
-        _logger = logging.getLogger("leakfix")
-        _logger.setLevel(logging.INFO)
-        if not _logger.handlers:
-            _LEAKFIX_HOME.mkdir(parents=True, exist_ok=True)
-            h = logging.FileHandler(_LEAKFIX_LOG, encoding="utf-8")
-            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            _logger.addHandler(h)
+        with _logger_lock:
+            if _logger is None:
+                _logger = logging.getLogger("leakfix")
+                _logger.setLevel(logging.INFO)
+                if not _logger.handlers:
+                    _LEAKFIX_HOME.mkdir(parents=True, exist_ok=True)
+                    h = logging.FileHandler(_LEAKFIX_LOG, encoding="utf-8")
+                    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                    _logger.addHandler(h)
     return _logger
 
 
@@ -78,8 +82,25 @@ FILE_PLACEHOLDER_SUFFIXES = (".example", ".sample", ".template", ".placeholder")
 # Directory path segments that indicate test/example code
 TEST_DIR_PATTERNS = ("/test", "/spec", "/mock", "/fixture", "/stub")
 
+# Extended path segments that indicate example/template files
+TEMPLATE_PATH_SEGMENTS = (
+    ".example", ".sample", ".template",
+    "/example", "/examples", "/sample", "/samples",
+    "/template", "/templates", "/docs", "/doc",
+    "readme", "contributing", "changelog",
+    "/fixtures", "/fixture", "/mocks", "/mock",
+    "/stubs", "/stub", "/seeds", "/seed",
+)
+
 # Entropy threshold below which we consider low entropy
 ENTROPY_THRESHOLD = 3.0
+
+# High-confidence rules where _check_value_is_word_like should be bypassed
+HIGH_CONFIDENCE_RULES = {
+    "aws-access-key", "aws-secret-key", "github-pat", "gitlab-pat",
+    "slack-token", "private-key", "private-key-pem", "openssh-private-key",
+    "generic-sk-secret-key",
+}
 
 
 def _compute_entropy(value: str) -> float:
@@ -111,60 +132,154 @@ class Classifier:
     def __init__(self, repo_root: Path | str | None = None):
         self.repo_root = Path(repo_root or ".").resolve()
 
+    def _load_context_lines(self, finding: Finding, window: int = 15) -> str:
+        """
+        Load ±window lines around the finding's line number.
+        Returns a formatted string with line numbers and a marker for the secret line.
+        Returns empty string if file unreadable or not on disk.
+        """
+        full_path = self.repo_root / finding.file
+        if not full_path.exists():
+            return ""
+        try:
+            lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+        line_idx = finding.line - 1
+        start = max(0, line_idx - window)
+        end = min(len(lines), line_idx + window + 1)
+
+        context_lines = []
+        for i in range(start, end):
+            marker = "  ← SECRET ON THIS LINE" if i == line_idx else ""
+            context_lines.append(f"  {i+1:4d}: {lines[i]}{marker}")
+        return "\n".join(context_lines)
+
+    def _load_file_header(self, finding: Finding, n: int = 5) -> str:
+        """Load first N lines of the file for top-level context (license, docstrings, comments)."""
+        full_path = self.repo_root / finding.file
+        if not full_path.exists():
+            return ""
+        try:
+            lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()[:n]
+            return "\n".join(f"  {i+1}: {l}" for i, l in enumerate(lines))
+        except (OSError, UnicodeDecodeError):
+            return ""
+
     def classify_finding(self, finding: Finding, llm_enabled: bool = False) -> ClassifiedFinding:
-        """Classify a single finding. Rules applied in priority order."""
-        # 1. File is .example, .sample, .template, .placeholder
+        """
+        Classify a single finding. Rules applied in priority order.
+        
+        New order (per CHANGE 5):
+        1. File is .example/.sample/.template/.placeholder → LIKELY_FALSE_POSITIVE (no LLM needed)
+        2. Known tool placeholder patterns → LIKELY_FALSE_POSITIVE (no LLM needed)
+        3. Placeholder substrings in value → LIKELY_FALSE_POSITIVE (no LLM needed)
+        4. Constant name (all caps + underscore) → LIKELY_FALSE_POSITIVE (no LLM needed)
+        4b. Value is word-like (plain word, not machine-generated) → LIKELY_FALSE_POSITIVE
+        5. Entropy < 3.0 → LIKELY_FALSE_POSITIVE (no LLM needed)
+        6. LLM ZONE: If llm_enabled AND file exists → call LLM with context
+        7. Comment context check (heuristic fallback) → REVIEW_NEEDED
+        8. Test directory check → LIKELY_FALSE_POSITIVE
+        9. Medium entropy without LLM → REVIEW_NEEDED
+        10. Default: CONFIRMED
+        """
+        # Step 1: File is .example, .sample, .template, .placeholder (extended patterns)
         file_result = self._check_file_patterns(finding.file)
         if file_result:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, file_result)
 
-        # 2. Placeholder patterns in value
-        placeholder_result = self._check_placeholder_patterns(finding.secret_value)
-        if placeholder_result:
-            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, placeholder_result)
-
-        # 3. Constant/variable name (all caps, underscores, no special chars)
-        constant_result = self._check_constant_name(finding.secret_value)
-        if constant_result:
-            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, constant_result)
-
-        # 4. Entropy below threshold
-        entropy_result = self._check_entropy(finding.secret_value, finding.rule_id, finding.entropy)
-        if entropy_result:
-            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, entropy_result)
-
-        # 5. File in test/spec/mock/fixture/stub directory
-        dir_result = self._check_test_directory(finding.file)
-        if dir_result:
-            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, dir_result)
-
-        # 6. Secret in comment line
-        comment_result = self._check_comment_context(finding)
-        if comment_result:
-            if llm_enabled:
-                llm_result = self._check_llm_classification(finding, llm_enabled)
-                if llm_result is not None:
-                    cls, reason = llm_result
-                    return ClassifiedFinding(finding, cls, reason)
-            return ClassifiedFinding(finding, Classification.REVIEW_NEEDED, comment_result)
-
-        # 7. Known tool placeholder patterns
+        # Step 2: Known tool placeholder patterns
         tool_result = self._check_tool_placeholder_patterns(finding.secret_value)
         if tool_result:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, tool_result)
 
-        # 8. Default: CONFIRMED
+        # Step 3: Placeholder patterns in value
+        placeholder_result = self._check_placeholder_patterns(finding.secret_value)
+        if placeholder_result:
+            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, placeholder_result)
+
+        # Step 4: Constant/variable name (all caps, underscores, no special chars)
+        constant_result = self._check_constant_name(finding.secret_value)
+        if constant_result:
+            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, constant_result)
+
+        # Step 4b: Value is word-like (plain word, not machine-generated secret)
+        word_result = self._check_value_is_word_like(finding.secret_value, finding.rule_id)
+        if word_result:
+            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, word_result)
+
+        # Step 5: Entropy below threshold (< 3.0 is definitely not a secret)
+        entropy_result = self._check_entropy(finding.secret_value, finding.rule_id, finding.entropy)
+        if entropy_result:
+            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, entropy_result)
+
+        # Step 6: LLM with context (the powerful path) - for all uncertain findings
+        if llm_enabled:
+            full_path = self.repo_root / finding.file
+            if full_path.exists():
+                llm_result = self._check_llm_classification(finding, llm_enabled)
+                if llm_result is not None:
+                    cls, reason = llm_result
+                    if cls != Classification.REVIEW_NEEDED:
+                        return ClassifiedFinding(finding, cls, reason)
+
+        # Step 7: Comment context check (heuristic fallback)
+        comment_result = self._check_comment_context(finding)
+        if comment_result:
+            return ClassifiedFinding(finding, Classification.REVIEW_NEEDED, comment_result)
+
+        # Step 8: Test directory check
+        dir_result = self._check_test_directory(finding.file)
+        if dir_result:
+            return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, dir_result)
+
+        # Step 9: Medium entropy without LLM → needs review
+        entropy = finding.entropy if finding.entropy is not None else _compute_entropy(finding.secret_value)
+        if entropy < 3.5 and not llm_enabled:
+            return ClassifiedFinding(
+                finding,
+                Classification.REVIEW_NEEDED,
+                f"Medium entropy ({entropy:.2f}) — manual review recommended",
+            )
+
+        # Step 10: Default — confirmed real secret
         return ClassifiedFinding(
             finding,
             Classification.CONFIRMED,
-            "High entropy, no placeholder patterns detected",
+            "High entropy, no placeholder patterns, no LLM context available",
         )
 
     def classify_findings(
         self, findings: list[Finding], llm_enabled: bool = False
     ) -> list[ClassifiedFinding]:
-        """Classify a list of findings."""
-        return [self.classify_finding(f, llm_enabled) for f in findings]
+        """Classify a list of findings. Uses parallel LLM calls when llm_enabled."""
+        if not llm_enabled or len(findings) <= 3:
+            return [self.classify_finding(f, llm_enabled) for f in findings]
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: list[ClassifiedFinding | None] = [None] * len(findings)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_idx = {
+                executor.submit(self.classify_finding, f, llm_enabled): i
+                for i, f in enumerate(findings)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception:
+                    results[idx] = ClassifiedFinding(
+                        findings[idx], Classification.REVIEW_NEEDED, "Classification error"
+                    )
+        # Safety net: ensure no None entries (e.g., from KeyboardInterrupt)
+        for i, r in enumerate(results):
+            if r is None:
+                results[i] = ClassifiedFinding(
+                    findings[i], Classification.REVIEW_NEEDED, "Classification not completed"
+                )
+        return results  # type: ignore[return-value]
 
     def classify_value(
         self,
@@ -175,41 +290,53 @@ class Classifier:
         """
         Classify a raw secret value (no Finding). Returns (classification, reason).
         Used by `leakfix classify <value>`.
+        
+        Step order matches classify_finding():
+        1. File patterns (if file_path provided)
+        2. Tool placeholder patterns
+        3. Placeholder patterns
+        4. Constant name
+        4b. Word-like check
+        5. Entropy
+        6. LLM (if enabled)
+        7. Comment context (skipped - no line context)
+        8. Test directory (if file_path provided)
+        9. Medium entropy fallback
+        10. Default: CONFIRMED
         """
-        # 1. File patterns (if file_path provided)
+        # Step 1: File patterns (if file_path provided)
         if file_path:
             file_result = self._check_file_patterns(file_path)
             if file_result:
                 return Classification.LIKELY_FALSE_POSITIVE, file_result
 
-        # 2. Placeholder patterns
+        # Step 2: Tool placeholder patterns
+        tool_result = self._check_tool_placeholder_patterns(value)
+        if tool_result:
+            return Classification.LIKELY_FALSE_POSITIVE, tool_result
+
+        # Step 3: Placeholder patterns
         placeholder_result = self._check_placeholder_patterns(value)
         if placeholder_result:
             return Classification.LIKELY_FALSE_POSITIVE, placeholder_result
 
-        # 3. Constant name
+        # Step 4: Constant name
         constant_result = self._check_constant_name(value)
         if constant_result:
             return Classification.LIKELY_FALSE_POSITIVE, constant_result
 
-        # 4. Entropy (use computed entropy, no rule_id from scanner)
+        # Step 4b: Word-like check (no rule_id available, use "generic")
+        word_result = self._check_value_is_word_like(value, "generic")
+        if word_result:
+            return Classification.LIKELY_FALSE_POSITIVE, word_result
+
+        # Step 5: Entropy (use computed entropy, no rule_id from scanner)
         entropy = _compute_entropy(value)
         entropy_result = self._check_entropy(value, "generic", entropy)
         if entropy_result:
             return Classification.LIKELY_FALSE_POSITIVE, entropy_result
 
-        # 5. Test directory (if file_path provided)
-        if file_path:
-            dir_result = self._check_test_directory(file_path)
-            if dir_result:
-                return Classification.LIKELY_FALSE_POSITIVE, dir_result
-
-        # 6. Tool placeholder patterns
-        tool_result = self._check_tool_placeholder_patterns(value)
-        if tool_result:
-            return Classification.LIKELY_FALSE_POSITIVE, tool_result
-
-        # 7. Would be CONFIRMED - optionally use LLM as second opinion
+        # Step 6: LLM (if enabled)
         if llm_enabled:
             synthetic_finding = Finding(
                 secret_value=value,
@@ -219,16 +346,28 @@ class Classifier:
                 author="",
                 date="",
                 rule_id="generic",
-                entropy=_compute_entropy(value),
+                entropy=entropy,
                 severity="medium",
             )
             llm_result = self._check_llm_classification(synthetic_finding, llm_enabled)
             if llm_result is not None:
                 cls, reason = llm_result
-                # Only use LLM result when it gives a definitive answer (not "LLM unavailable")
                 if cls != Classification.REVIEW_NEEDED:
                     return cls, reason
 
+        # Step 7: Comment context - skipped (no line context available for raw value)
+
+        # Step 8: Test directory (if file_path provided)
+        if file_path:
+            dir_result = self._check_test_directory(file_path)
+            if dir_result:
+                return Classification.LIKELY_FALSE_POSITIVE, dir_result
+
+        # Step 9: Medium entropy fallback (without LLM)
+        if entropy < 3.5 and not llm_enabled:
+            return Classification.REVIEW_NEEDED, f"Medium entropy ({entropy:.2f}) — manual review recommended"
+
+        # Step 10: Default — confirmed real secret
         return Classification.CONFIRMED, "High entropy, no placeholder patterns detected"
 
     def _check_placeholder_patterns(self, value: str) -> str | None:
@@ -255,11 +394,16 @@ class Classifier:
         return None
 
     def _check_file_patterns(self, file_path: str) -> str | None:
-        """Check if file is .example, .sample, .template, .placeholder. Returns reason or None."""
+        """Check if file is .example, .sample, .template, .placeholder or in template path. Returns reason or None."""
         path_lower = file_path.lower().replace("\\", "/")
+        # Original suffix check
         for suffix in FILE_PLACEHOLDER_SUFFIXES:
             if suffix in path_lower or path_lower.endswith(suffix):
                 return f"File is example/template ({suffix})"
+        # Extended path segment check
+        for segment in TEMPLATE_PATH_SEGMENTS:
+            if segment in path_lower:
+                return f"File is in example/template path ({segment})"
         return None
 
     def _check_entropy(
@@ -311,6 +455,29 @@ class Classifier:
             return "Constant name, not a secret"
         return None
 
+    def _check_value_is_word_like(self, value: str, rule_id: str = "") -> str | None:
+        """
+        Check if value looks like a human-typed word rather than a machine-generated secret.
+        Real secrets are base64/hex/random; fake ones are readable words.
+        Heuristic: if value is all alpha + maybe digits, no mixed case alternation,
+        length < 24, and entropy < 3.5 → likely a placeholder word.
+        
+        Bypassed for high-confidence rules (AWS keys, GitHub PATs, etc.) where
+        even word-like values may be real tokens.
+        """
+        # Bypass for high-confidence structured rules
+        if rule_id.lower() in HIGH_CONFIDENCE_RULES:
+            return None
+        if len(value) > 32 or len(value) < 6:
+            return None
+        # All alphabetic (possibly with digits) — no symbols
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9]*$', value):
+            return None
+        entropy = _compute_entropy(value)
+        if entropy < 3.2:
+            return f"Value appears to be a plain word/name (entropy {entropy:.2f}), not a machine-generated secret"
+        return None
+
     def _check_test_directory(self, file_path: str) -> str | None:
         """Check if file is in test/spec/mock/fixture/stub directory. Returns reason or None."""
         path_lower = file_path.lower().replace("\\", "/")
@@ -325,7 +492,7 @@ class Classifier:
         llm_enabled: bool,
     ) -> tuple[Classification, str] | None:
         """
-        Use ollama LLM to classify a REVIEW_NEEDED finding.
+        Use ollama LLM to classify a finding with full code context.
         Returns (Classification, reason) or None if ollama not installed.
         """
         try:
@@ -341,42 +508,86 @@ class Classifier:
         config = load_config()
         model = config.get("llm_model") or "qwen3:0.6b"
 
-        prompt = f"""You are a security expert reviewing code for leaked credentials.
+        context_lines = self._load_context_lines(finding, window=15)
+        file_header = self._load_file_header(finding, n=5)
+        file_extension = Path(finding.file).suffix
+        file_name = Path(finding.file).name
 
-Is this a real secret credential or a placeholder/example value?
+        prompt = f"""You are a senior security engineer reviewing code for leaked credentials.
 
-Value: {finding.secret_value}
-File: {finding.file}
-Secret type detected: {finding.rule_id}
+## Task
+Classify whether the detected value is a REAL credential or a PLACEHOLDER/EXAMPLE.
 
-Rules:
-- REAL = actual credential that would grant access to a system
-- PLACEHOLDER = example, template, dummy, or documentation value
+## Secret Details
+- Detected value: `{finding.secret_value}`
+- Secret type (gitleaks rule): {finding.rule_id}
+- File: {finding.file}
+- File name: {file_name}
+- File extension: {file_extension}
+- Line number: {finding.line}
+- Entropy score: {finding.entropy:.2f} (real secrets typically > 4.5)
 
-Answer with only one word: REAL or PLACEHOLDER"""
+## File Header (first lines of the file):
+{file_header if file_header else "(file not on disk — from git history)"}
+
+## Code Context (±15 lines around the secret):
+{context_lines if context_lines else "(context unavailable — secret found in git history only)"}
+
+## Classification Rules
+
+A value is a PLACEHOLDER if ANY of these are true:
+1. The file is clearly an example/template (name contains: .example, .sample, .template, README, CONTRIBUTING, docs/)
+2. Surrounding lines contain comments like "# replace this", "# fill in", "# your key here", "# copy to .env"
+3. The value itself contains obvious placeholder words: YOUR_, REPLACE_, EXAMPLE_, CHANGE_ME, XXXXXXX, 0000, 1234, dummy, test
+4. Other values on nearby lines are also obvious placeholders (e.g., DB_HOST=localhost, PASSWORD=changeme)
+5. The value is used in a test assertion or mock setup
+6. The value appears in documentation (markdown, rst, txt files)
+7. The value is surrounded by quotes in a comment or docstring context
+8. Multiple similar files exist with the same value (boilerplate pattern)
+
+A value is REAL if ALL of these are true:
+1. It is in a file that is NOT an example/template (e.g., actual .env, config.py, settings.py)
+2. The surrounding code shows real operational configuration (database URLs, hostnames, ports with real values)
+3. The value has high entropy and does not match any placeholder patterns above
+4. No surrounding comments suggest it is an example
+
+## Decision
+Answer with EXACTLY one word on the first line:
+- `REAL` if this is a genuine credential that grants access to a real system
+- `PLACEHOLDER` if this is an example, template, dummy, or documentation value
+
+Then on the second line, provide a ONE sentence reason starting with "Reason:".
+
+Example good response:
+PLACEHOLDER
+Reason: File is .env.example and surrounding lines show other placeholder values like DB_HOST=localhost.
+"""
 
         try:
-            client = Client(host="http://localhost:11434", timeout=10.0)
+            client = Client(host="http://localhost:11434", timeout=15.0)
             response = client.chat(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                options={"num_predict": 50},
+                options={"num_predict": 100, "temperature": 0},
             )
             msg = response.message if hasattr(response, "message") else response.get("message", {})
-            # qwen3 thinking models return answer in content, reasoning in thinking
             msg_content = msg.content if hasattr(msg, "content") else (msg.get("content") if isinstance(msg, dict) else "")
-            msg_thinking = msg.thinking if hasattr(msg, "thinking") else ""
-            # Use content first, fall back to thinking if content empty
-            text = (msg_content or msg_thinking or "").upper()
+            text = (msg_content or "").strip()
         except Exception as e:
-            _get_logger().info("LLM unavailable (ollama not running?): %s", e)
+            _get_logger().info("LLM unavailable: %s", e)
             return Classification.REVIEW_NEEDED, "LLM unavailable"
 
-        if "REAL" in text:
-            return Classification.CONFIRMED, "LLM classified as real credential"
-        if "PLACEHOLDER" in text:
-            return Classification.LIKELY_FALSE_POSITIVE, "LLM classified as placeholder"
-        return Classification.REVIEW_NEEDED, "LLM unavailable"
+        # Parse response — first non-empty line is REAL or PLACEHOLDER
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        verdict = lines[0].upper() if lines else ""
+        reason_line = next((l for l in lines if l.lower().startswith("reason:")), "")
+        reason = reason_line.replace("Reason:", "").replace("reason:", "").strip() or "LLM classified"
+
+        if "PLACEHOLDER" in verdict:
+            return Classification.LIKELY_FALSE_POSITIVE, f"LLM (context-aware): {reason}"
+        if "REAL" in verdict:
+            return Classification.CONFIRMED, f"LLM (context-aware): {reason}"
+        return Classification.REVIEW_NEEDED, "LLM gave ambiguous response"
 
     def _check_tool_placeholder_patterns(self, value: str) -> str | None:
         """Check known placeholder patterns for specific tools. Returns reason or None."""

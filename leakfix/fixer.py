@@ -43,6 +43,36 @@ def _escape_for_replacements(secret: str) -> str:
     return secret.replace("==>", "\\==>")
 
 
+def _safe_replacement(rule_id: str) -> str:
+    """
+    Return a replacement string that:
+    - Has very low entropy (all same chars or obvious pattern)
+    - Is clearly a placeholder — won't be flagged by any scanner
+    - Is contextually appropriate for the secret type
+    - Never empty (empty values still suspicious on variable lines)
+    """
+    rule_lower = rule_id.lower()
+    if "aws" in rule_lower:
+        return "AKIAIOSFODNN7EXAMPLE"
+    if "github" in rule_lower or "ghp" in rule_lower:
+        return "ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    if "gitlab" in rule_lower:
+        return "glpat-xxxxxxxxxxxxxxxxxxxx"
+    if "slack" in rule_lower:
+        return "xoxb-REDACTED"
+    if "stripe" in rule_lower:
+        return "sk_test_REDACTED"
+    if "twilio" in rule_lower:
+        return "SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    if "sendgrid" in rule_lower:
+        return "SG-REDACTED"
+    if "openai" in rule_lower or "sk-" in rule_lower:
+        return "sk-REDACTED"
+    if "private-key" in rule_lower or "pem" in rule_lower:
+        return "-----BEGIN PRIVATE KEY-----\nREDACTED_BY_LEAKFIX\n-----END PRIVATE KEY-----"
+    return "REDACTED"
+
+
 class Fixer:
     """Fixes leaked secrets in working files and git history."""
 
@@ -50,6 +80,17 @@ class Fixer:
         self.source = Path(source or ".").resolve()
         self.repo_root = get_repo_root(self.source) or self.source
         self.scanner = Scanner(self.source)
+        self._skipped_untracked_files: set[str] = set()
+
+    def _is_git_tracked(self, file_path: str) -> bool:
+        """Return True if file is tracked by git."""
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", file_path],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode == 0
 
     def fix_all(
         self,
@@ -61,6 +102,7 @@ class Fixer:
         confirm: bool = False,
         include_review: bool = False,
         llm_enabled: bool = False,
+        include_untracked: bool = False,
     ) -> tuple[bool, str]:
         """
         Main entry point. Scan, fix working files, rewrite history, commit, push.
@@ -72,8 +114,10 @@ class Fixer:
         if not check_git_filter_repo_installed():
             return False, "git-filter-repo not found. Run: brew install git-filter-repo"
 
-        # Run scan first
-        findings = self.scanner.scan_all()
+        # Run scan first - use include_untracked for working directory scan
+        working_findings = self.scanner.scan_working_directory(include_untracked=include_untracked)
+        history_findings = self.scanner.scan_history()
+        findings = self.scanner._dedupe_findings(working_findings + history_findings)
         if not findings:
             return True, "No secrets found"
 
@@ -139,8 +183,18 @@ class Fixer:
         commit_count = self._count_commits()
 
         if not history_only:
-            self._fix_working_files(findings, replace_with, confirm=False)
+            self._fix_working_files(findings, replace_with, confirm=False, include_untracked=include_untracked)
             self._commit_changes("chore(security): remove secrets detected by leakfix")
+
+        # Build skipped warnings for untracked files
+        all_skipped = self.scanner._untracked_files_warned | self._skipped_untracked_files
+        skipped_warnings = ""
+        if all_skipped:
+            skipped_lines = [
+                f"⚠️  Skipped {f} (not tracked by git — safe to keep secrets here)"
+                for f in sorted(all_skipped)
+            ]
+            skipped_warnings = "\n" + "\n".join(skipped_lines)
 
         if not files_only:
             # Save remote URL BEFORE git-filter-repo removes it
@@ -173,9 +227,9 @@ class Fixer:
 
         # Re-verify: use classifier so only CONFIRMED secrets count as failures
         if files_only:
-            remaining = self.scanner.scan_working_directory()
+            remaining = self.scanner.scan_working_directory(include_untracked=include_untracked)
         else:
-            remaining = self.scanner.scan_all()
+            remaining = self.scanner.scan_all(include_untracked=include_untracked)
         if remaining:
             classified_remaining = classifier.classify_findings(remaining, llm_enabled)
             confirmed = [c for c in classified_remaining if c.classification == Classification.CONFIRMED]
@@ -184,7 +238,7 @@ class Fixer:
                 if c.classification == Classification.LIKELY_FALSE_POSITIVE
             ]
             if confirmed:
-                return False, f"Verification failed: {len(confirmed)} confirmed secret(s) still present"
+                return False, f"Verification failed: {len(confirmed)} confirmed secret(s) still present{skipped_warnings}"
             msg = (
                 f"✅ 0 confirmed secrets remaining ({len(false_positives)} false positives skipped)\n"
                 f"{secret_count} secret(s) removed from {file_count} file(s) across {commit_count} commit(s)"
@@ -193,12 +247,14 @@ class Fixer:
                 msg += f"\nBinary files skipped: {', '.join(sorted(binary_files))}"
             if push_skipped:
                 msg += "\n⚠️  Push skipped (no remote, protected branch, or push rejected)"
+            msg += skipped_warnings
             return True, msg
         summary = f"{secret_count} secret(s) removed from {file_count} file(s) across {commit_count} commit(s)"
         if binary_files:
             summary += f"\nBinary files skipped: {', '.join(sorted(binary_files))}"
         if push_skipped:
             summary += "\n⚠️  Push skipped (no remote, protected branch, or push rejected)"
+        summary += skipped_warnings
         return True, summary
 
     def _dry_run_output(
@@ -214,7 +270,7 @@ class Fixer:
         lines.append("")
         for f in findings:
             display_secret = _mask_secret_for_display(f.secret_value)
-            replacement = replace_with if replace_with else "(empty)"
+            replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
             lines.append(f"  {f.file}:{f.line} - {display_secret} → {replacement}")
         if binary_files:
             lines.append("")
@@ -247,7 +303,7 @@ class Fixer:
         confirmed = []
         for f in findings:
             display_secret = _mask_secret_for_display(f.secret_value)
-            replacement = replace_with if replace_with else "(empty)"
+            replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
             if Confirm.ask(
                 f"Replace in {f.file}:{f.line} - {display_secret} → {replacement}?",
                 default=True,
@@ -260,6 +316,7 @@ class Fixer:
         findings: list[Finding],
         replace_with: str,
         confirm: bool = False,
+        include_untracked: bool = False,
     ) -> None:
         """Replace secrets in current working files."""
         # Group by file
@@ -267,7 +324,17 @@ class Fixer:
         for f in findings:
             by_file.setdefault(f.file, []).append(f)
 
+        # Pre-compute tracked files set (one git call instead of N)
+        tracked: set[str] = set()
+        if not include_untracked:
+            tracked = self.scanner.get_tracked_files()
+
         for file_path_str, file_findings in by_file.items():
+            # Skip untracked files unless include_untracked is True
+            if not include_untracked and file_path_str not in tracked:
+                self._skipped_untracked_files.add(file_path_str)
+                continue
+
             full_path = self.repo_root / file_path_str
             if not full_path.exists() or _is_binary_file(full_path):
                 continue
@@ -281,14 +348,17 @@ class Fixer:
                 line_idx = f.line - 1
                 if 0 <= line_idx < len(lines):
                     old_line = lines[line_idx]
-                    # Replace all occurrences of the secret on this line
-                    new_line = old_line.replace(f.secret_value, replace_with)
+                    # Determine replacement: use rule-specific if replace_with is empty
+                    actual_replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
+                    new_line = old_line.replace(f.secret_value, actual_replacement)
                     if new_line != old_line:
                         lines[line_idx] = new_line
             full_path.write_text("".join(lines))
 
-        # Stage changed files
+        # Stage changed files (only tracked ones)
         for file_path_str in by_file:
+            if file_path_str in self._skipped_untracked_files:
+                continue
             full_path = self.repo_root / file_path_str
             if full_path.exists():
                 subprocess.run(
@@ -304,14 +374,17 @@ class Fixer:
         replace_with: str,
     ) -> Path | None:
         """Create replacements.txt for git-filter-repo. Format: literal:secret==>replacement"""
-        # Dedupe by secret value - same secret gets one replacement rule
-        secrets_seen: set[str] = set()
+        # Dedupe by (secret_value, rule_id) - same secret with same rule gets one replacement
+        # When replace_with is empty, use rule-specific safe replacement
+        secrets_seen: set[tuple[str, str]] = set()
         replacements: list[str] = []
         for f in findings:
-            if f.secret_value not in secrets_seen:
-                secrets_seen.add(f.secret_value)
+            key = (f.secret_value, f.rule_id if not replace_with else "")
+            if key not in secrets_seen:
+                secrets_seen.add(key)
                 escaped = _escape_for_replacements(f.secret_value)
-                replacements.append(f"literal:{escaped}==>{replace_with}")
+                actual_replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
+                replacements.append(f"literal:{escaped}==>{actual_replacement}")
         if not replacements:
             return None
         fd, path = tempfile.mkstemp(suffix=".txt", prefix="leakfix-replacements-")
@@ -349,7 +422,7 @@ class Fixer:
         if not result.stdout.strip():
             return
         subprocess.run(
-            ["git", "add", "-A"],
+            ["git", "add", "-u"],
             cwd=str(self.repo_root),
             capture_output=True,
             check=True,
@@ -394,10 +467,6 @@ class Fixer:
             capture_output=True,
             check=False,
         )
-
-    def _verify_clean(self) -> list[Finding]:
-        """Run final scan to verify no secrets remain."""
-        return self.scanner.scan_all()
 
     def _count_commits(self) -> int:
         """Count commits in the repository."""
