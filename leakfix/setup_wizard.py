@@ -86,13 +86,14 @@ def _print_deps(status: dict) -> bool:
         ("gitleaks", status["gitleaks"]),
         ("git-filter-repo", status["git-filter-repo"]),
         ("python3", status["python3"]),
-        ("ollama (CLI)", status["ollama"]),
     ]:
         if found:
             print(f"  ✅ {name}")
         else:
             print(f"  ❌ {name}")
             ok = False
+    ollama_cli = status.get("ollama", False)
+    print(f"  {'✅' if ollama_cli else '❌'} ollama (CLI)")
     if not status["gitleaks"]:
         print("\n  Install: brew install gitleaks")
     if not status["git-filter-repo"]:
