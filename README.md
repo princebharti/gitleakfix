@@ -5,7 +5,7 @@ This is the official Homebrew tap for [leakfix](https://github.com/princebharti/
 ## Installation
 
 ```bash
-brew tap princebharti/leakfix
+brew tap princebharti/tap
 brew install leakfix
 ```
 
