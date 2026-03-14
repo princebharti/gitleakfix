@@ -1,0 +1,36 @@
+# leakfix extended gitleaks config
+# Extends default gitleaks rules with additional token patterns not in gitleaks defaults.
+# See README.md for detection scope.
+
+title = "leakfix-extended"
+
+[extend]
+useDefault = true
+
+# JIRA/Atlassian tokens (ATATT...)
+[[rules]]
+id = "jira-atlassian-token"
+description = "JIRA/Atlassian API token"
+regex = '''ATATT[a-zA-Z0-9_-]{20,}'''
+tags = ["token", "jira", "atlassian"]
+
+# Figma tokens (figd_...)
+[[rules]]
+id = "figma-token"
+description = "Figma API token"
+regex = '''figd_[a-zA-Z0-9]{20,}'''
+tags = ["token", "figma"]
+
+# Generic sk- secret key (OpenAI-style and similar)
+[[rules]]
+id = "generic-sk-secret-key"
+description = "Generic sk- secret key (OpenAI-style API key)"
+regex = '''sk-[a-zA-Z0-9]{20,}'''
+tags = ["key", "api", "openai"]
+
+# Generic TOKEN= in env files (catches JIRA_TOKEN, FIGMA_TOKEN, etc.)
+[[rules]]
+id = "generic-token-env"
+description = "Generic TOKEN variable in env (20+ chars)"
+regex = '''[A-Z_][A-Z0-9_]*TOKEN\s*=\s*[a-zA-Z0-9_-]{20,}'''
+tags = ["token", "env"]
