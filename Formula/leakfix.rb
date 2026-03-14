@@ -220,6 +220,15 @@ class Leakfix < Formula
     sha256 "2b349d742a07527d236f0b4b6cab26f53ebecad0ceabfc09ec4c6a396e3176f9"
   end
 
+  def caveats
+    <<~EOS
+      To enable LLM-powered secret classification, install Ollama:
+        brew install ollama
+      Then run:
+        leakfix setup --llm
+    EOS
+  end
+
   def install
     virtualenv_install_with_resources
   end
