@@ -118,7 +118,7 @@ cd "$TAP_DIR"
 git pull origin main
 
 # Read actual version from formula file to avoid drift
-OLD_VERSION=$(grep -o 'refs/tags/v[0-9.]*' Formula/leakfix.rb | head -1 | sed 's|refs/tags/v||')
+OLD_VERSION=$(grep -o 'refs/tags/v[0-9][0-9.]*[0-9]' Formula/leakfix.rb | head -1 | sed 's|refs/tags/v||')
 [[ -z "$OLD_VERSION" ]] && die "Could not read current version from Formula/leakfix.rb"
 log "Tap is currently at v$OLD_VERSION"
 
