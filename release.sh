@@ -131,8 +131,13 @@ grep "v$NEW_VERSION" Formula/leakfix.rb > /dev/null || die "URL update failed in
 grep "$SHA256" Formula/leakfix.rb > /dev/null || die "sha256 update failed in formula"
 
 git add Formula/leakfix.rb
-git commit -m "chore: bump leakfix to v$NEW_VERSION"
-git push origin main
+# Only commit if there's something to commit
+if [[ -n "$(git status --porcelain)" ]]; then
+    git commit -m "chore: bump leakfix to v$NEW_VERSION"
+    git push origin main
+else
+    warn "Tap already up to date — skipping commit step"
+fi
 
 # ─── Step 7: Clean reinstall to verify ───────────────────
 log "Cleaning up existing installation..."
