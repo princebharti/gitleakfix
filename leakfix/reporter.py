@@ -328,7 +328,11 @@ class Reporter:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            raise ImportError("playwright is required for PDF reports. pip install playwright && playwright install chromium")
+            import subprocess, sys
+            print("Installing playwright for PDF generation...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "--break-system-packages", "-q"], check=True)
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            from playwright.sync_api import sync_playwright
 
         # Generate HTML first to temp file, then convert to PDF
         import tempfile

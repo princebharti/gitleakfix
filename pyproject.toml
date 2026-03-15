@@ -14,7 +14,7 @@ dependencies = [
     "ollama>=0.1.0",
     "watchdog>=3.0.0",
     "Jinja2>=3.0.0",
-    "playwright>=1.40.0",
+    # playwright is installed lazily on first PDF generation
     "rich>=13.0.0",
     "rich-gradient>=0.3.11",
     "GitPython>=3.1.0",
