@@ -403,8 +403,8 @@ def run_setup(llm_only: bool = False, reset: bool = False, check_only: bool = Fa
         return False
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        raise
     
     # Fallback to existing questionary wizard
     return _run_questionary_wizard(llm_only=llm_only, reset=reset, check_only=check_only)

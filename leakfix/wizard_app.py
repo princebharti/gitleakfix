@@ -96,6 +96,14 @@ def _is_model_installed_locally(model: str) -> bool:
 def _verify_model_exists_in_registry(model: str) -> bool:
     """Check if model exists in ollama library by attempting manifest pull."""
     try:
+        # Ensure ollama serve is running before checking
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        import time; time.sleep(1)
         result = subprocess.run(
             ["ollama", "show", model],
             capture_output=True,
@@ -109,13 +117,19 @@ def _verify_model_exists_in_registry(model: str) -> bool:
 
 def _strip_ansi(text: str) -> str:
     """Strip all ANSI escape sequences and non-printable characters."""
-    # Strip all ANSI escape sequences
+    # Strip DEC private mode sequences like ?2026h ?25l
+    text = re.sub(r'\x1b\[\?[0-9;]*[a-zA-Z]', '', text)
+    # Strip standard ANSI escape sequences
     text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
     text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
     text = re.sub(r'\x1b[PX^_].*?\x1b\\', '', text)
-    text = re.sub(r'\x1b.', '', text)  # catch any remaining ESC sequences
+    text = re.sub(r'\x1b.', '', text)
+    # Strip carriage returns
+    text = re.sub(r'\r', '', text)
+    text = re.sub(r'\x0f|\x0e', '', text)
     # Strip non-printable characters except newline and tab
     text = re.sub(r'[^\x09\x0a\x20-\x7e]', '', text)
+    text = re.sub(r' {2,}', ' ', text)
     return text.strip()
 
 
@@ -179,6 +193,15 @@ class NFStatic(Static):
 
 class NFLabel(Label):
     """Non-focusable Label widget - Tab key skips this."""
+    can_focus = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NON-FOCUSABLE SCROLL CONTAINER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NFVerticalScroll(VerticalScroll):
+    """Non-focusable VerticalScroll — Tab skips container but reaches children."""
     can_focus = False
 
 
@@ -285,7 +308,7 @@ class OptionList(Widget):
 
 class ShimmerHeader(Static):
     """Animated Apple Intelligence header panel with left-aligned content."""
-    
+    can_focus = False
     frame: reactive[int] = reactive(0)
     
     def __init__(
@@ -357,6 +380,10 @@ Screen {
     layout: vertical;
 }
 
+VerticalScroll {
+    scrollbar-size: 0 0;
+}
+
 ShimmerHeader {
     width: 60%;
     content-align: center middle;
@@ -377,6 +404,7 @@ ShimmerHeader {
     height: 1fr;
     overflow-y: auto;
     overflow-x: hidden;
+    &:focus { background: #1C1C1E; }
 }
 
 .section-label {
@@ -447,7 +475,7 @@ OptionList > .option-item.selected {
 Button {
     background: #BC82F3;
     color: #1C1C1E;
-    border: none;
+    border: heavy #BC82F3;
     min-width: 18;
     max-width: 24;
     width: auto;
@@ -462,7 +490,7 @@ Button:hover {
 
 Button:focus {
     background: #C686FF;
-    border: tall #F5B9EA;
+    border: heavy #F5B9EA;
     width: auto;
     height: 3;
 }
@@ -475,7 +503,7 @@ Button.-active {
 Button.secondary {
     background: transparent;
     color: #6E6E73;
-    border: none;
+    border: heavy transparent;
     text-style: none;
     width: auto;
     min-width: 10;
@@ -484,7 +512,7 @@ Button.secondary {
 
 Button.secondary:focus {
     color: #F5F5F7;
-    border: tall #3A3A3C;
+    border: heavy #3A3A3C;
     background: transparent;
     width: auto;
     height: 3;
@@ -501,14 +529,29 @@ Button.secondary.-active {
     border: none;
 }
 
+Button.cancel-btn {
+    color: #FF6778;
+    border: heavy transparent;
+}
+
+Button.cancel-btn:focus {
+    color: #FF6778;
+    border: heavy #FF6778;
+}
+
+Button.cancel-btn:hover {
+    color: #FF6778;
+    background: transparent;
+}
+
 Input {
     background: #2C2C2E;
-    border: tall #3A3A3C;
+    border: heavy #3A3A3C;
     color: #F5F5F7;
     padding: 0 2;
     height: 3;
-    width: 1fr;
-    margin: 0 0 1 0;
+    width: 25%;
+    margin: 0 0 1 2;
 }
 
 Input:focus {
@@ -516,13 +559,13 @@ Input:focus {
 }
 
 Input.-invalid {
-    border: tall #FF6778;
+    border: heavy #FF6778;
 }
 
 Label {
     color: #F5F5F7;
     text-style: bold;
-    padding: 1 0 0 0;
+    padding: 1 0 1 0;
 }
 
 #progress-bar {
@@ -564,10 +607,18 @@ Label {
         self._pull_error: str = ""
         self._progress_frame: int = 0
         self._progress_timer: Timer | None = None
+        self._pull_process = None
     
+    def on_exception(self, error: Exception) -> None:
+        import traceback, sys
+        with open("/tmp/wizard_crash.log", "a") as f:
+            traceback.print_exc(file=f)
+        self.exit()
+
     def compose(self) -> ComposeResult:
         yield ShimmerHeader()
-        yield VerticalScroll(id="content-panel")
+        scroll = NFVerticalScroll(id="content-panel")
+        yield scroll
     
     def on_mount(self) -> None:
         if self.llm_only:
@@ -576,10 +627,28 @@ Label {
             self._show_enable_llm()
     
     def _clear_content(self) -> None:
+        """Clear the content panel and stop any running timers."""
+        # Stop any running progress timer before wiping the DOM
+        if self._progress_timer is not None:
+            try:
+                self._progress_timer.stop()
+            except Exception:
+                pass
+            self._progress_timer = None
+        
+        # Mark pull as complete to prevent timer callbacks from running
+        self._pull_complete = True
+        
         self._screen_count += 1
-        panel = self.query_one("#content-panel")
-        for child in list(panel.children):
-            child.remove()
+        try:
+            panel = self.query_one("#content-panel")
+            for child in list(panel.children):
+                try:
+                    child.remove()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self._validation_error_widget = None
     
     def _option_id(self) -> str:
@@ -700,6 +769,7 @@ Label {
             Button("Back", id="back-to-provider", classes="secondary"),
             classes="button-row"
         ))
+        self.set_timer(0.1, lambda: self.query_one("#custom-model-input", Input).focus())
     
     def _show_openai_config(self) -> None:
         """Show OpenAI-compatible API configuration."""
@@ -746,6 +816,7 @@ Label {
         
         # Add spacer at bottom to ensure button is visible when scrolling
         panel.mount(NFStatic("", classes="bottom-spacer"))
+        self.set_timer(0.1, lambda: self.query_one("#openai-url-input", Input).focus())
     
     def _focus_options(self) -> None:
         """Focus the wizard option list after mounting."""
@@ -773,8 +844,140 @@ Label {
         config["setup_complete"] = True
         self._finish(config)
     
+    def _show_ollama_install_progress(self, model_name: str) -> None:
+        """Show animated progress screen while installing ollama via brew."""
+        self._clear_content()
+        self._current_screen = "ollama-install"
+        panel = self.query_one("#content-panel")
+
+        panel.mount(NFStatic("[bold #8D9FFF]  Installing ollama[/bold #8D9FFF]", classes="section-label", markup=True))
+        panel.mount(NFStatic(_make_gradient_separator(30), classes="separator"))
+        panel.mount(NFStatic("  ollama not found — installing via Homebrew...", classes="question-text"))
+        panel.mount(NFStatic("  Sit tight, this usually takes 30–60 seconds.", classes="hint-text"))
+        panel.mount(NFStatic("", id="install-bar"))
+        panel.mount(NFStatic("", id="install-status"))
+        panel.mount(NFStatic("", id="install-detail"))
+
+        self._progress_frame = 0
+        self._pull_complete = False
+        self._install_pct = 0
+        self._install_step = "Step 1/3  Downloading ollama via Homebrew..."
+
+        def _do_install():
+            import subprocess as sp, time, shutil
+            try:
+                self._install_step = "Step 1/3  Downloading ollama via Homebrew..."
+                self._install_pct = 5
+                result = sp.run(["brew", "install", "ollama"], capture_output=True)
+                if result.returncode != 0:
+                    raise Exception("brew install failed")
+
+                self._install_step = "Step 2/3  Starting ollama server..."
+                self._install_pct = 75
+                sp.Popen(["ollama", "serve"], stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True)
+                time.sleep(2)
+
+                self._install_step = "Step 3/3  Verifying installation..."
+                self._install_pct = 90
+                time.sleep(1)
+                success = shutil.which("ollama") is not None
+            except Exception:
+                success = False
+            self._pull_complete = True
+            self._pull_success = success
+            self.call_from_thread(self._on_ollama_install_complete, model_name, success)
+
+        threading.Thread(target=_do_install, daemon=True).start()
+        self._progress_timer = self.set_interval(1/10, self._tick_install_progress)
+
+    def _tick_install_progress(self) -> None:
+        """Animate progress bar during ollama install."""
+        if self._pull_complete:
+            if self._progress_timer:
+                self._progress_timer.stop()
+            return
+
+        self._progress_frame += 1
+        frame = self._progress_frame
+
+        WAVE = ["#BC82F3", "#AA6EEE", "#8D9FFF", "#F5B9EA", "#BC82F3"]
+        bar_width = 40
+        pct = getattr(self, "_install_pct", 0)
+        filled = int(bar_width * pct / 100)
+
+        bar_text = Text()
+        bar_text.append("  ")
+        for i in range(filled):
+            t = (i / max(bar_width - 1, 1) + frame * 0.03) % 1.0
+            ts = t * (len(WAVE) - 1)
+            seg = min(int(ts), len(WAVE) - 2)
+            color = _interpolate_hex(WAVE[seg], WAVE[seg + 1], ts - seg)
+            bar_text.append("━", style=color)
+        bar_text.append("░" * (bar_width - filled), style="#3A3A3C")
+        bar_text.append(f"  {pct}%", style="bold #BC82F3")
+
+        spinners = ["◆", "◈", "◇", "◈"]
+        spinner = spinners[frame % len(spinners)]
+        step = getattr(self, "_install_step", "Preparing...")
+
+        try:
+            self.query_one("#install-bar").update(bar_text)
+            self.query_one("#install-status").update(f"  [{spinner}] {step}")
+        except Exception:
+            pass
+
+    def _on_ollama_install_complete(self, model_name: str, success: bool) -> None:
+        """Called when ollama install finishes."""
+        if success:
+            try:
+                self.query_one("#install-bar").update(
+                    Text("  " + "━" * 40 + "  100%", style="bold #30D158")
+                )
+                self.query_one("#install-status").update(
+                    Text("  ✓ ollama installed! Starting model download...", style="bold #30D158")
+                )
+            except Exception:
+                pass
+            self.set_timer(1.5, lambda: self._show_download_progress(model_name))
+        else:
+            try:
+                self.query_one("#install-bar").update(
+                    Text("  ✗ Installation failed", style="bold #FF6778")
+                )
+                self.query_one("#install-status").update(
+                    Text("  Try manually: brew install ollama", style="#FF6778")
+                )
+            except Exception:
+                pass
+
+    def _show_already_installed(self, model: str) -> None:
+        """Show message that model is already installed and save config."""
+        self._clear_content()
+        self._current_screen = "already-installed"
+        panel = self.query_one("#content-panel")
+
+        panel.mount(NFStatic("[bold #8D9FFF]  Model Ready[/bold #8D9FFF]", classes="section-label", markup=True))
+        panel.mount(NFStatic(_make_gradient_separator(), classes="separator"))
+        panel.mount(NFStatic(f"  [bold #30D158]✓ Model already installed — no download needed[/bold #30D158]", classes="question-text", markup=True))
+        panel.mount(NFStatic(f"  {model} is ready to use.", classes="hint-text"))
+        panel.mount(NFStatic("", classes="hint-text"))
+        panel.mount(NFStatic("  Saving configuration...", classes="hint-text", id="saving-status"))
+
+        # Save config and exit after brief pause
+        self.set_timer(1.5, lambda: self._finish_with_config({
+            **self.config,
+            "llm_enabled": True,
+            "llm_provider": "ollama",
+            "llm_model": model,
+            "llm_base_url": "http://localhost:11434",
+            "llm_api_key": "",
+        }))
+
     def _show_download_progress(self, model: str) -> None:
         """Show animated download progress screen."""
+        # Store model for use in timer callback
+        self._current_download_model = model
+        
         self._clear_content()
         self._current_screen = "download"
         panel = self.query_one("#content-panel")
@@ -787,13 +990,17 @@ Label {
         panel.mount(NFStatic("", id="progress-status"))
         panel.mount(NFStatic("", id="progress-detail"))
         panel.mount(NFStatic("  (this may take a few minutes)", classes="hint-text", id="progress-hint"))
+        panel.mount(Horizontal(
+            Button("✕  Cancel", id="cancel-download", classes="secondary cancel-btn"),
+            classes="button-row"
+        ))
 
         # Reset progress state
         self._pull_complete = False
         self._pull_success = False
         self._pull_error = ""
         self._progress_frame = 0
-        
+
         def _do_pull():
             try:
                 result = subprocess.run(
@@ -805,10 +1012,8 @@ Label {
                 self._pull_success = result.returncode == 0
                 if not self._pull_success:
                     raw = result.stderr or result.stdout or "Unknown error"
-                    # Use improved ANSI stripping
                     cleaned = _strip_ansi(raw)
-                    # Get first meaningful line only
-                    error_lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+                    error_lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
                     self._pull_error = error_lines[0] if error_lines else "Model not found or network error"
             except subprocess.TimeoutExpired:
                 self._pull_success = False
@@ -822,17 +1027,48 @@ Label {
             finally:
                 self._pull_complete = True
                 self.call_from_thread(self._on_pull_complete, model)
-        
+
         threading.Thread(target=_do_pull, daemon=True).start()
-        
-        # Start progress animation timer (10fps)
-        self._progress_timer = self.set_interval(1/10, lambda: self._tick_progress(model))
+
+        # Start progress animation timer (10fps) - use method reference instead of lambda
+        self._progress_timer = self.set_interval(1/10, self._tick_progress_safe)
+
+
+    def _tick_progress_safe(self) -> None:
+        """Safe wrapper for progress tick that handles exceptions."""
+        try:
+            # Check if we're still on the download screen
+            if self._current_screen != "download":
+                if self._progress_timer:
+                    self._progress_timer.stop()
+                    self._progress_timer = None
+                return
+            
+            model = getattr(self, '_current_download_model', 'model')
+            self._tick_progress(model)
+        except Exception as e:
+            # Log error but don't crash
+            import traceback
+            with open("/tmp/wizard_crash.log", "a") as f:
+                f.write(f"_tick_progress_safe error: {e}\n")
+                traceback.print_exc(file=f)
+            # Stop the timer on error
+            if self._progress_timer:
+                try:
+                    self._progress_timer.stop()
+                except Exception:
+                    pass
+                self._progress_timer = None
 
     def _tick_progress(self, model: str) -> None:
         """Animate the progress bar while download is running."""
         if self._pull_complete:
             if self._progress_timer:
-                self._progress_timer.stop()
+                try:
+                    self._progress_timer.stop()
+                except Exception:
+                    pass
+                self._progress_timer = None
             return
         
         self._progress_frame += 1
@@ -879,62 +1115,100 @@ Label {
         ]
         msg = messages[(frame // 15) % len(messages)]
         
+        # Update UI - check widgets exist before updating
         try:
-            self.query_one("#progress-bar").update(bar_text)
-            self.query_one("#progress-status").update(f"  [{spinner}] {msg}")
+            progress_bar = self.query_one("#progress-bar", NFStatic)
+            progress_status = self.query_one("#progress-status", NFStatic)
+            progress_bar.update(bar_text)
+            progress_status.update(f"  [{spinner}] {msg}")
         except Exception:
-            pass
+            # Widgets may have been removed - stop timer
+            if self._progress_timer:
+                try:
+                    self._progress_timer.stop()
+                except Exception:
+                    pass
+                self._progress_timer = None
 
     def _on_pull_complete(self, model: str) -> None:
         """Called when pull finishes — show success or error."""
+        # Stop timer first
         if self._progress_timer:
             try:
                 self._progress_timer.stop()
             except Exception:
                 pass
+            self._progress_timer = None
+        
+        # Verify we're still on the download screen
+        if self._current_screen != "download":
+            return
         
         if self._pull_success:
             # Show success briefly then finish
             try:
-                self.query_one("#progress-bar").update(
+                progress_bar = self.query_one("#progress-bar", NFStatic)
+                progress_status = self.query_one("#progress-status", NFStatic)
+                progress_detail = self.query_one("#progress-detail", NFStatic)
+                
+                progress_bar.update(
                     Text("  " + "━" * 40 + "  100%", style="bold #30D158")
                 )
-                self.query_one("#progress-status").update(
+                progress_status.update(
                     Text(f"  ✓ {model} ready", style="bold #30D158")
                 )
-                self.query_one("#progress-detail").update("")
-            except Exception:
-                pass
+                progress_detail.update("")
+            except Exception as e:
+                import traceback
+                with open("/tmp/wizard_crash.log", "a") as f:
+                    f.write(f"_on_pull_complete success UI error: {e}\n")
+                    traceback.print_exc(file=f)
             
             # Save config and exit after brief pause
-            self.set_timer(1.5, lambda: self._finish_with_config({
+            config_to_save = {
                 **self.config,
                 "llm_enabled": True,
                 "llm_provider": "ollama",
                 "llm_model": model,
                 "llm_base_url": "http://localhost:11434",
                 "llm_api_key": "",
-            }))
+            }
+            self.set_timer(1.5, lambda: self._finish_with_config(config_to_save))
         else:
             # Show error
             try:
-                self.query_one("#progress-bar").update(
+                # Hide cancel button on failure
+                try:
+                    cancel_btn = self.query_one("#cancel-download", Button)
+                    cancel_btn.display = False
+                except Exception:
+                    pass
+                
+                progress_bar = self.query_one("#progress-bar", NFStatic)
+                progress_status = self.query_one("#progress-status", NFStatic)
+                progress_detail = self.query_one("#progress-detail", NFStatic)
+                
+                progress_bar.update(
                     Text("  ✗ Download failed", style="bold #FF6778")
                 )
                 error_short = self._pull_error[:100] if self._pull_error else "Unknown error"
-                self.query_one("#progress-status").update(
+                progress_status.update(
                     Text(f"  {error_short}", style="#FF6778")
                 )
-                self.query_one("#progress-detail").update(
+                progress_detail.update(
                     Text("  Press Escape to go back", style="#6E6E73")
                 )
                 # Hide the "(this may take a few minutes)" hint on failure
                 try:
-                    self.query_one("#progress-hint").display = False
+                    hint = self.query_one("#progress-hint", NFStatic)
+                    hint.display = False
                 except Exception:
                     pass
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                with open("/tmp/wizard_crash.log", "a") as f:
+                    f.write(f"_on_pull_complete error UI error: {e}\n")
+                    traceback.print_exc(file=f)
     
     def _handle_continue(self) -> None:
         """Trigger the continue/select button for the current screen."""
@@ -1001,7 +1275,20 @@ Label {
             idx = self._selected_model if isinstance(self._selected_model, int) else 0
             if idx < len(LLM_MODELS):
                 model = LLM_MODELS[idx][0]
-                self._show_download_progress(model)
+                # Check if model is already installed
+                def _check_and_proceed_model():
+                    try:
+                        if _is_model_installed_locally(model):
+                            self.call_from_thread(self._show_already_installed, model)
+                        else:
+                            self.call_from_thread(self._show_download_progress, model)
+                    except Exception as e:
+                        import traceback
+                        with open("/tmp/wizard_crash.log", "a") as f:
+                            traceback.print_exc(file=f)
+                        self.call_from_thread(self._show_download_progress, model)
+                
+                threading.Thread(target=_check_and_proceed_model, daemon=True).start()
             else:
                 # Last option is "Enter a different model name..."
                 self._show_custom_model_input()
@@ -1010,37 +1297,41 @@ Label {
             try:
                 input_widget = self.query_one("#custom-model-input", Input)
                 model_name = input_widget.value.strip()
-                
+
                 # Step 1: Validate format
                 error = _validate_model_name(model_name)
                 if error:
                     self._show_validation_error(error)
                     return
-                
-                # Step 2: Check if already installed locally
-                if _is_model_installed_locally(model_name):
-                    # Skip download, go straight to config save
-                    self._finish_with_config({
-                        **self.config,
-                        "llm_enabled": True,
-                        "llm_provider": "ollama",
-                        "llm_model": model_name,
-                        "llm_base_url": "http://localhost:11434",
-                        "llm_api_key": "",
-                    })
+
+                # Step 2: Ensure ollama is installed before doing anything
+                import shutil
+                if not shutil.which("ollama"):
+                    self._show_ollama_install_progress(model_name)
                     return
-                
-                # Step 3: Check if model exists in ollama registry
-                if not _verify_model_exists_in_registry(model_name):
-                    self._show_validation_error(
-                        f"✗ Model '{model_name}' not found in ollama library.\n"
-                        "  Check https://ollama.com/library for available models.\n"
-                        "  Try: qwen3:0.6b, llama3.2:3b, phi4, deepseek-r1:7b"
-                    )
-                    return
-                
-                # Step 4: Model exists, proceed to download
-                self._show_download_progress(model_name)
+
+                # Step 3: Check locally + proceed — all off the main thread
+                def _check_and_proceed():
+                    try:
+                        if _is_model_installed_locally(model_name):
+                            # Model already installed - show success message and save config
+                            self.call_from_thread(
+                                self._show_already_installed,
+                                model_name
+                            )
+                        else:
+                            self.call_from_thread(self._show_download_progress, model_name)
+                    except Exception as e:
+                        import traceback
+                        with open("/tmp/wizard_crash.log", "a") as f:
+                            traceback.print_exc(file=f)
+                        self.call_from_thread(
+                            self._show_validation_error,
+                            f"Error: {str(e)[:50]}"
+                        )
+
+                threading.Thread(target=_check_and_proceed, daemon=True).start()
+
             except Exception:
                 self._show_validation_error("An error occurred. Please try again.")
         
@@ -1073,6 +1364,21 @@ Label {
             except Exception:
                 self._show_validation_error("An error occurred. Please try again.")
         
+        elif button_id == "cancel-download":
+            try:
+                if getattr(self, "_pull_process", None):
+                    self._pull_process.terminate()
+                    self._pull_process = None
+                if getattr(self, "_progress_timer", None):
+                    self._progress_timer.stop()
+                self._pull_complete = True
+            except Exception:
+                pass
+            if self.llm_only:
+                self._show_provider_choice()
+            else:
+                self._show_enable_llm()
+
         elif button_id == "cancel":
             self.exit(result=None)
     
