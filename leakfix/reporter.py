@@ -324,11 +324,11 @@ class Reporter:
         output: Path,
         classified: list[ClassifiedFinding] | None = None,
     ) -> None:
-        """Generate PDF report using weasyprint."""
+        """Generate PDF report using playwright headless chromium."""
         try:
-            from weasyprint import HTML
+            from playwright.sync_api import sync_playwright
         except ImportError:
-            raise ImportError("weasyprint is required for PDF reports. pip install weasyprint")
+            raise ImportError("playwright is required for PDF reports. pip install playwright && playwright install chromium")
 
         # Generate HTML first to temp file, then convert to PDF
         import tempfile
@@ -336,8 +336,12 @@ class Reporter:
             tmp_path = Path(tmp.name)
         try:
             self._generate_html(findings, tmp_path, classified=classified)
-            html_doc = HTML(filename=str(tmp_path))
-            html_doc.write_pdf(str(output))
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto(f"file://{tmp_path.resolve()}")
+                page.pdf(path=str(output), format="A4", print_background=True)
+                browser.close()
         finally:
             tmp_path.unlink(missing_ok=True)
 
