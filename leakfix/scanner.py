@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from leakfix.utils import check_gitleaks_installed, get_repo_root
+
+
+def check_ggshield_installed() -> bool:
+    """Check if ggshield is installed."""
+    return shutil.which("ggshield") is not None
 
 
 @dataclass
@@ -24,6 +31,7 @@ class Finding:
     rule_id: str
     entropy: float
     severity: str
+    scanner: str = "gitleaks"  # "gitleaks", "ggshield", or "both"
 
 
 def _derive_severity(rule_id: str, entropy: float) -> str:
@@ -81,13 +89,31 @@ def _is_ignored(file_path: str, patterns: list[str], repo_root: Path) -> bool:
 
 
 class Scanner:
-    """Wraps gitleaks to provide a clean, unified scanning interface."""
+    """Wraps gitleaks and ggshield to provide a clean, unified scanning interface."""
 
     def __init__(self, source: Path | str | None = None):
         self.source = Path(source or ".").resolve()
         self.repo_root = get_repo_root(self.source) or self.source
         self._skipped_untracked: list[Finding] = []
         self._untracked_files_warned: set[str] = set()
+        self._ggshield_available: bool | None = None
+        self._ggshield_message_shown: bool = False
+
+    @property
+    def ggshield_available(self) -> bool:
+        """Check if ggshield is available (cached)."""
+        if self._ggshield_available is None:
+            self._ggshield_available = check_ggshield_installed()
+        return self._ggshield_available
+
+    def get_scanner_info_message(self) -> str | None:
+        """
+        Return info message about scanner availability.
+        Returns None if ggshield is available, otherwise returns install hint.
+        """
+        if self.ggshield_available:
+            return None
+        return "ℹ️  ggshield not found — using gitleaks only. Install: brew install ggshield"
 
     def get_tracked_files(self) -> set[str]:
         """Return set of relative paths tracked by git (via git ls-files)."""
@@ -111,8 +137,11 @@ class Scanner:
 
     def scan_working_directory(self, include_untracked: bool = False) -> list[Finding]:
         """Scan files on disk. By default only scans git-tracked files."""
-        findings: list[Finding] = []
-        findings.extend(self._run_gitleaks(["detect", "--no-git"]))
+        # Use dual-scanner if ggshield is available
+        def gitleaks_scan():
+            return self._run_gitleaks(["detect", "--no-git"])
+
+        findings = self._scan_with_both_scanners(gitleaks_scan, ggshield_history=False)
         findings = self._dedupe_findings(self._filter_ignored(findings))
 
         if include_untracked:
@@ -136,12 +165,17 @@ class Scanner:
 
     def scan_staged(self) -> list[Finding]:
         """Scan only staged files (for pre-commit hook)."""
+        # Note: ggshield doesn't have a staged-only mode, so we use gitleaks only for staged
         findings = self._run_gitleaks(["protect", "--staged"])
         return self._dedupe_findings(self._filter_ignored(findings))
 
     def scan_history(self) -> list[Finding]:
         """Scan full git history."""
-        findings = self._run_gitleaks(["detect"])
+        # Use dual-scanner if ggshield is available
+        def gitleaks_scan():
+            return self._run_gitleaks(["detect"])
+
+        findings = self._scan_with_both_scanners(gitleaks_scan, ggshield_history=True)
         return self._filter_ignored(findings)
 
     def scan_all(self, include_untracked: bool = False) -> list[Finding]:
@@ -259,3 +293,198 @@ class Scanner:
             if key not in by_key or f.entropy > by_key[key].entropy:
                 by_key[key] = f
         return list(by_key.values())
+
+    def _run_ggshield(self, scan_history: bool = False) -> list[Finding]:
+        """Run ggshield and return parsed findings."""
+        if not check_ggshield_installed():
+            return []
+
+        # ggshield secret scan repo scans git history by default
+        # For working directory only, use "ggshield secret scan path ."
+        if scan_history:
+            cmd = ["ggshield", "secret", "scan", "repo", ".", "--json"]
+        else:
+            cmd = ["ggshield", "secret", "scan", "path", ".", "--json"]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(self.source),
+                timeout=600,  # 10 minute timeout for history scans
+            )
+            output = result.stdout or ""
+            return self._parse_ggshield_output(output)
+        except subprocess.TimeoutExpired:
+            return []
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return []
+
+    def _parse_ggshield_output(self, json_output: str) -> list[Finding]:
+        """Parse ggshield JSON output into Finding objects."""
+        findings = []
+        try:
+            data = json.loads(json_output)
+        except json.JSONDecodeError:
+            return findings
+
+        # ggshield JSON structure varies by scan type:
+        # - repo scan: {"scans": [{"entities_with_incidents": [...], "extra_info": {...}}, ...]}
+        # - path scan: {"entities_with_incidents": [...]}
+        
+        # Collect all entities with their scan context (for commit info)
+        scan_entities = []
+        
+        # Try scans structure first (repo scan)
+        scans = data.get("scans", [])
+        for scan in scans:
+            extra_info = scan.get("extra_info", {})
+            commit_sha = scan.get("id", "")  # scan id is the commit sha
+            author = extra_info.get("email", "")
+            date = extra_info.get("date", "")
+            
+            for entity in scan.get("entities_with_incidents", []):
+                scan_entities.append((entity, commit_sha, author, date))
+        
+        # Try direct entities_with_incidents (path scan)
+        if not scan_entities:
+            for entity in data.get("entities_with_incidents", []):
+                scan_entities.append((entity, "", "", ""))
+        
+        # Try results structure (older versions)
+        if not scan_entities:
+            for entity in data.get("results", []):
+                scan_entities.append((entity, "", "", ""))
+
+        for entity, commit_sha, author, date in scan_entities:
+            if not isinstance(entity, dict):
+                continue
+
+            # Get file info
+            file_path = entity.get("filename", entity.get("file", ""))
+            if not file_path:
+                continue
+            file_path = self._normalize_file_path(file_path)
+
+            # Get incidents (secrets found)
+            incidents = entity.get("incidents", [])
+            for incident in incidents:
+                if not isinstance(incident, dict):
+                    continue
+
+                # Extract secret info
+                secret_type = incident.get("type", incident.get("detector", "unknown"))
+                
+                # Get match value from occurrences (ggshield masks secrets by default)
+                match_value = ""
+                line = 0
+                occurrences = incident.get("occurrences", [])
+                if occurrences and isinstance(occurrences[0], dict):
+                    match_value = occurrences[0].get("match", "")
+                    line = occurrences[0].get("line_start", occurrences[0].get("line", 0))
+                
+                # Fallback to incident-level fields
+                if not match_value:
+                    match_value = incident.get("match", "")
+                if not line:
+                    line = incident.get("line_start", incident.get("line", 0))
+
+                # Map ggshield severity to our severity levels
+                # ggshield doesn't always provide severity, default to high for detected secrets
+                gg_severity = incident.get("severity", "high").lower()
+                if gg_severity in ("critical", "high"):
+                    severity = "high"
+                elif gg_severity == "medium":
+                    severity = "medium"
+                else:
+                    severity = "low"
+
+                findings.append(
+                    Finding(
+                        secret_value=match_value,
+                        file=file_path,
+                        line=int(line) if line else 0,
+                        commit=commit_sha,
+                        author=author,
+                        date=date,
+                        rule_id=secret_type,
+                        entropy=0.0,  # ggshield doesn't provide entropy
+                        severity=severity,
+                        scanner="ggshield",
+                    )
+                )
+
+        return findings
+
+    def _merge_scanner_findings(
+        self, gitleaks_findings: list[Finding], ggshield_findings: list[Finding]
+    ) -> list[Finding]:
+        """
+        Merge findings from both scanners, deduplicating by (file, line, secret_type).
+        If both scanners find the same thing, mark it as detected by both.
+        """
+        # Index gitleaks findings by (file, line, normalized_rule)
+        by_key: dict[tuple[str, int, str], Finding] = {}
+
+        def normalize_rule(rule: str) -> str:
+            """Normalize rule names for comparison."""
+            return rule.lower().replace("-", "_").replace(" ", "_")
+
+        for f in gitleaks_findings:
+            key = (f.file, f.line, normalize_rule(f.rule_id))
+            by_key[key] = f
+
+        # Merge ggshield findings
+        for f in ggshield_findings:
+            key = (f.file, f.line, normalize_rule(f.rule_id))
+            if key in by_key:
+                # Found by both scanners - mark as "both"
+                existing = by_key[key]
+                by_key[key] = Finding(
+                    secret_value=existing.secret_value or f.secret_value,
+                    file=existing.file,
+                    line=existing.line,
+                    commit=existing.commit or f.commit,
+                    author=existing.author or f.author,
+                    date=existing.date or f.date,
+                    rule_id=existing.rule_id,
+                    entropy=existing.entropy if existing.entropy else f.entropy,
+                    severity=existing.severity if existing.severity != "low" else f.severity,
+                    scanner="both",
+                )
+            else:
+                # Only found by ggshield
+                by_key[key] = f
+
+        return list(by_key.values())
+
+    def _scan_with_both_scanners(
+        self, gitleaks_func, ggshield_history: bool = False
+    ) -> list[Finding]:
+        """
+        Run gitleaks and ggshield in parallel (if ggshield is available).
+        Returns merged and deduplicated findings.
+        """
+        ggshield_available = check_ggshield_installed()
+
+        if not ggshield_available:
+            # Fallback to gitleaks only
+            return gitleaks_func()
+
+        # Run both scanners in parallel
+        gitleaks_findings: list[Finding] = []
+        ggshield_findings: list[Finding] = []
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_gitleaks = executor.submit(gitleaks_func)
+            future_ggshield = executor.submit(self._run_ggshield, ggshield_history)
+
+            for future in as_completed([future_gitleaks, future_ggshield]):
+                if future == future_gitleaks:
+                    gitleaks_findings = future.result()
+                else:
+                    ggshield_findings = future.result()
+
+        # Merge and deduplicate
+        return self._merge_scanner_findings(gitleaks_findings, ggshield_findings)

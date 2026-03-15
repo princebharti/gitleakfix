@@ -172,6 +172,7 @@ class Classifier:
         Classify a single finding. Rules applied in priority order.
         
         New order (per CHANGE 5):
+        0. Finding detected by BOTH scanners → CONFIRMED (high confidence, skip LLM)
         1. File is .example/.sample/.template/.placeholder → LIKELY_FALSE_POSITIVE (no LLM needed)
         2. Known tool placeholder patterns → LIKELY_FALSE_POSITIVE (no LLM needed)
         3. Placeholder substrings in value → LIKELY_FALSE_POSITIVE (no LLM needed)
@@ -184,6 +185,15 @@ class Classifier:
         9. Medium entropy without LLM → REVIEW_NEEDED
         10. Default: CONFIRMED
         """
+        # Step 0: Finding detected by BOTH scanners → auto-confirm (high confidence)
+        scanner = getattr(finding, 'scanner', 'gitleaks')
+        if scanner == "both":
+            return ClassifiedFinding(
+                finding,
+                Classification.CONFIRMED,
+                "Detected by both gitleaks and ggshield — high confidence real secret",
+            )
+
         # Step 1: File is .example, .sample, .template, .placeholder (extended patterns)
         file_result = self._check_file_patterns(finding.file)
         if file_result:
@@ -210,7 +220,9 @@ class Classifier:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, word_result)
 
         # Step 5: Entropy below threshold (< 3.0 is definitely not a secret)
-        entropy_result = self._check_entropy(finding.secret_value, finding.rule_id, finding.entropy)
+        # If entropy is 0 (e.g., from ggshield which doesn't provide it), compute it
+        entropy_to_check = finding.entropy if finding.entropy > 0 else _compute_entropy(finding.secret_value)
+        entropy_result = self._check_entropy(finding.secret_value, finding.rule_id, entropy_to_check)
         if entropy_result:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, entropy_result)
 
@@ -235,7 +247,8 @@ class Classifier:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, dir_result)
 
         # Step 9: Medium entropy without LLM → needs review
-        entropy = finding.entropy if finding.entropy is not None else _compute_entropy(finding.secret_value)
+        # Use computed entropy if finding.entropy is 0 (e.g., from ggshield)
+        entropy = finding.entropy if finding.entropy > 0 else _compute_entropy(finding.secret_value)
         if entropy < 3.5 and not llm_enabled:
             return ClassifiedFinding(
                 finding,

@@ -114,6 +114,7 @@ class Fixer:
         include_review: bool = False,
         llm_enabled: bool = False,
         include_untracked: bool = False,
+        fix_all_findings: bool = False,
     ) -> tuple[bool, str]:
         """
         Main entry point. Scan, fix working files, rewrite history, commit, push.
@@ -153,19 +154,24 @@ class Fixer:
 
         findings = text_findings
 
-        # Classify and filter: only fix CONFIRMED (and REVIEW_NEEDED if include_review)
-        classifier = Classifier(self.repo_root)
-        classified = classifier.classify_findings(findings, llm_enabled)
-        fixable = [
-            c.finding
-            for c in classified
-            if c.classification == Classification.CONFIRMED
-            or (include_review and c.classification == Classification.REVIEW_NEEDED)
-        ]
-        findings = fixable
+        # When fix_all_findings is True, skip classification and fix everything
+        if fix_all_findings:
+            # Fix all findings regardless of classification
+            pass  # findings = text_findings (already set)
+        else:
+            # Classify and filter: only fix CONFIRMED (and REVIEW_NEEDED if include_review)
+            classifier = Classifier(self.repo_root)
+            classified = classifier.classify_findings(findings, llm_enabled)
+            fixable = [
+                c.finding
+                for c in classified
+                if c.classification == Classification.CONFIRMED
+                or (include_review and c.classification == Classification.REVIEW_NEEDED)
+            ]
+            findings = fixable
 
-        if not findings:
-            return True, "No confirmed secrets to fix (all filtered as false positives)"
+            if not findings:
+                return True, "No confirmed secrets to fix (all filtered as false positives)"
 
         # Dedupe by (secret_value, file, line) - same secret on same line = one replacement
         seen: set[tuple[str, str, int]] = set()
@@ -179,11 +185,14 @@ class Fixer:
         findings = unique_findings
 
         if dry_run:
-            false_positives_count = len(
-                [c for c in classified if c.classification == Classification.LIKELY_FALSE_POSITIVE]
-            )
+            if fix_all_findings:
+                false_positives_count = 0  # Not applicable in fix-all mode
+            else:
+                false_positives_count = len(
+                    [c for c in classified if c.classification == Classification.LIKELY_FALSE_POSITIVE]
+                )
             return self._dry_run_output(
-                findings, replace_with, binary_files, false_positives_count
+                findings, replace_with, binary_files, false_positives_count, fix_all_findings
             )
         if confirm:
             findings = self._confirm_findings(findings, replace_with)
@@ -240,11 +249,10 @@ class Fixer:
                     check=False,
                 )
 
-        push_skipped = False
+        push_summary = ""
         if not no_push:
-            pushed = self._force_push()
-            if not pushed:
-                push_skipped = True
+            push_results = self._force_push_all_branches()
+            push_summary = self._format_push_summary(push_results)
 
         file_count = len({f.file for f in findings})
         secret_count = len(findings)
@@ -269,15 +277,15 @@ class Fixer:
             )
             if binary_files:
                 msg += f"\nBinary files skipped: {', '.join(sorted(binary_files))}"
-            if push_skipped:
-                msg += "\n⚠️  Push skipped (no remote, protected branch, or push rejected)"
+            if push_summary:
+                msg += f"\n{push_summary}"
             msg += skipped_warnings
             return True, msg
         summary = f"{secret_count} secret(s) removed from {file_count} file(s) across {commit_count} commit(s)"
         if binary_files:
             summary += f"\nBinary files skipped: {', '.join(sorted(binary_files))}"
-        if push_skipped:
-            summary += "\n⚠️  Push skipped (no remote, protected branch, or push rejected)"
+        if push_summary:
+            summary += f"\n{push_summary}"
         summary += skipped_warnings
         return True, summary
 
@@ -287,9 +295,13 @@ class Fixer:
         replace_with: str,
         binary_files: set[str],
         false_positives_count: int = 0,
+        fix_all_mode: bool = False,
     ) -> tuple[bool, str]:
         """Generate dry-run output."""
         lines = ["DRY RUN - No changes will be made", ""]
+        if fix_all_mode:
+            lines.insert(1, "⚠️  Fix-all mode: removing all findings including false positives")
+            lines.insert(2, "")
         lines.append(f"Would replace {len(findings)} secret(s) in {len({f.file for f in findings})} file(s):")
         lines.append("")
         for f in findings:
@@ -305,9 +317,22 @@ class Fixer:
         lines.append("")
         commit_count = self._count_commits()
         lines.append(f"Would rewrite {commit_count} commit(s) in git history")
-        remote, branch = self._get_remote_and_branch()
-        if remote and branch:
-            lines.append(f"Would force push to {remote}/{branch}")
+        
+        # Show all branches that would be pushed
+        branches = self._get_all_local_branches()
+        remotes_result = subprocess.run(
+            ["git", "remote"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        remotes = [r.strip() for r in (remotes_result.stdout or "").split() if r.strip()]
+        
+        if remotes and branches:
+            remote = "origin" if "origin" in remotes else remotes[0]
+            lines.append(f"Would force push {len(branches)} branch(es) to {remote}:")
+            for branch in branches:
+                lines.append(f"  - {branch}")
         else:
             lines.append("Would skip push (no remote configured)")
         lines.append("")
@@ -480,6 +505,69 @@ class Fixer:
                 return False
             raise
 
+    def _get_all_local_branches(self) -> list[str]:
+        """Get all local branch names."""
+        result = subprocess.run(
+            ["git", "branch", "--format=%(refname:short)"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+
+    def _force_push_all_branches(self) -> dict[str, str]:
+        """
+        Force push all local branches to remote after history rewrite.
+        Returns dict mapping branch name to status:
+          - "pushed": successfully pushed
+          - "protected": branch is protected, push rejected
+          - "no_remote": no remote configured
+          - "error": other error occurred
+        """
+        branches = self._get_all_local_branches()
+        if not branches:
+            return {}
+
+        # Check if any remote exists
+        remotes_result = subprocess.run(
+            ["git", "remote"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        remotes = [r.strip() for r in (remotes_result.stdout or "").split() if r.strip()]
+        if not remotes:
+            return {b: "no_remote" for b in branches}
+
+        remote = "origin" if "origin" in remotes else remotes[0]
+        results: dict[str, str] = {}
+
+        for branch in branches:
+            try:
+                push_result = subprocess.run(
+                    [
+                        "git", "push", "--force", remote, branch,
+                        "-o", "secret_push_protection.skip_all"
+                    ],
+                    cwd=str(self.repo_root),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                results[branch] = "pushed"
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or "").lower()
+                if "protected" in stderr or "rejected" in stderr:
+                    results[branch] = "protected"
+                elif "no such remote" in stderr or "does not appear to be a git repository" in stderr:
+                    results[branch] = "no_remote"
+                else:
+                    results[branch] = "error"
+
+        return results
+
     def _cleanup_reflog(self) -> None:
         """Run git reflog expire + git gc."""
         subprocess.run(
@@ -494,6 +582,43 @@ class Fixer:
             capture_output=True,
             check=False,
         )
+
+    def _format_push_summary(self, push_results: dict[str, str]) -> str:
+        """Format the push results into a human-readable summary."""
+        if not push_results:
+            return ""
+
+        lines: list[str] = []
+        pushed = [b for b, s in push_results.items() if s == "pushed"]
+        protected = [b for b, s in push_results.items() if s == "protected"]
+        no_remote = [b for b, s in push_results.items() if s == "no_remote"]
+        errors = [b for b, s in push_results.items() if s == "error"]
+
+        # Show individual branch results
+        for branch in pushed:
+            lines.append(f"✓  Force pushed cleaned history to {branch}")
+
+        for branch in protected:
+            lines.append(f"⚠️  Could not push {branch} (protected) — unprotect in GitLab/GitHub settings and re-run")
+
+        if no_remote:
+            lines.append("⚠️  No remote configured — run: git remote add origin <url>")
+
+        for branch in errors:
+            lines.append(f"⚠️  Failed to push {branch} (unknown error)")
+
+        # Add summary line
+        if lines:
+            lines.append("")
+            summary_parts = []
+            if pushed:
+                summary_parts.append(f"{len(pushed)} pushed")
+            if protected or no_remote or errors:
+                skipped_count = len(protected) + len(no_remote) + len(errors)
+                summary_parts.append(f"{skipped_count} skipped")
+            lines.append(f"Push summary: {', '.join(summary_parts)}")
+
+        return "\n".join(lines)
 
     def _count_commits(self) -> int:
         """Count commits in the repository."""

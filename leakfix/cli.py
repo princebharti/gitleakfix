@@ -96,6 +96,16 @@ def _filter_by_severity(findings: list[Finding], severity: str | None) -> list[F
     return [f for f in findings if f.severity.lower() in allowed]
 
 
+def _format_scanner_badge(scanner: str) -> str:
+    """Format scanner source as a colored badge."""
+    if scanner == "both":
+        return "[bold green]both[/bold green]"
+    elif scanner == "ggshield":
+        return "[cyan]ggshield[/cyan]"
+    else:
+        return "[dim]gitleaks[/dim]"
+
+
 def _format_table(findings: list[Finding]) -> None:
     """Print findings as a rich table."""
     table = Table(
@@ -108,15 +118,18 @@ def _format_table(findings: list[Finding]) -> None:
     table.add_column("Secret Type", style="yellow")
     table.add_column("Line", justify="right")
     table.add_column("Severity", style="red")
+    table.add_column("Scanner", justify="center")
     table.add_column("Commit", style="dim")
     table.add_column("Author", style="dim")
     for f in findings:
         commit_short = f.commit[:7] if len(f.commit) >= 7 else f.commit
+        scanner_badge = _format_scanner_badge(getattr(f, 'scanner', 'gitleaks'))
         table.add_row(
             f.file,
             f.rule_id,
             str(f.line),
             f.severity.upper(),
+            scanner_badge,
             commit_short,
             f.author or "-",
         )
@@ -137,6 +150,7 @@ def _format_json(findings: list[Finding]) -> None:
             "rule_id": f.rule_id,
             "entropy": f.entropy,
             "severity": f.severity,
+            "scanner": getattr(f, 'scanner', 'gitleaks'),
             "secret_masked": _mask_for_smart_display(f.secret_value),
         }
         for f in findings
@@ -174,6 +188,15 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
     ]
     review_needed = [c for c in classified if c.classification == Classification.REVIEW_NEEDED]
 
+    def scanner_tag(finding: Finding) -> str:
+        """Get scanner tag for display."""
+        scanner = getattr(finding, 'scanner', 'gitleaks')
+        if scanner == "both":
+            return "[bold green][both][/bold green] "
+        elif scanner == "ggshield":
+            return "[cyan][gg][/cyan] "
+        return ""
+
     if confirmed:
         console.print(f"\n[bold red]  CONFIRMED SECRETS[/bold red] [dim]({len(confirmed)} found)[/dim]")
         console.print("[magenta]" + "─" * 53 + "[/magenta]")
@@ -181,27 +204,32 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
             masked = _mask_for_smart_display(c.finding.secret_value)
             entropy = c.finding.entropy
             severity = c.finding.severity.upper()
-            console.print(f"[bold red]REAL[/bold red]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
+            stag = scanner_tag(c.finding)
+            console.print(f"[bold red]REAL[/bold red]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
             console.print(f"      Value: [bold]{masked}[/bold]  [dim]Entropy: {entropy:.2f}  Severity: {severity}[/dim]")
             if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
                 console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
+            elif getattr(c.finding, 'scanner', 'gitleaks') == "both":
+                console.print(f"      [green]Auto-confirmed[/green]: detected by both gitleaks and ggshield")
             console.print()
 
     if false_positives:
         console.print(f"\n[bold #8D9FFF]  FALSE POSITIVES[/bold #8D9FFF] [dim]({len(false_positives)} skipped)[/dim]")
         console.print("[#8D9FFF]" + "─" * 53 + "[/#8D9FFF]")
         for c in false_positives:
+            stag = scanner_tag(c.finding)
             if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
-                console.print(f"[dim]SKIP[/dim]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
+                console.print(f"[dim]SKIP[/dim]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
                 console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
             else:
-                console.print(f"[dim]SKIP[/dim]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
+                console.print(f"[dim]SKIP[/dim]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
 
     if review_needed:
         console.print(f"\n[bold yellow]  REVIEW NEEDED[/bold yellow] [dim]({len(review_needed)} items)[/dim]")
         console.print("[yellow]" + "─" * 53 + "[/yellow]")
         for c in review_needed:
-            console.print(f"[yellow]WARN[/yellow]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
+            stag = scanner_tag(c.finding)
+            console.print(f"[yellow]WARN[/yellow]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
 
     console.print("\n[magenta]" + "─" * 53 + "[/magenta]")
     console.print(
@@ -305,10 +333,20 @@ def setup(llm: bool, check: bool, reset: bool):
             icon = "[green]✅[/green]" if found else "[red]❌[/red]"
             label = "ollama (CLI)" if name == "ollama" else name
             console.print(f"  {icon} {label}")
+
+        # Show ggshield status (optional dependency)
+        ggshield_found = status.get("ggshield", False)
+        if ggshield_found:
+            console.print(f"  [green]✅[/green] ggshield")
+        else:
+            console.print(f"  [yellow]⚠️[/yellow]  ggshield [dim](optional)[/dim]")
+
         if not status["gitleaks"]:
             console.print("\n  Install: brew install gitleaks")
         if not status["git-filter-repo"]:
             console.print("  Install: brew install git-filter-repo")
+        if not ggshield_found:
+            console.print("  Install ggshield (optional): brew install ggshield")
         if not status.get("ollama_pip"):
             console.print("  Install ollama Python: leakfix setup --llm")
 
@@ -447,6 +485,11 @@ def scan(
 
     repo_root = get_repo_root(path) or path
     scanner = Scanner(path)
+
+    # Show ggshield availability message
+    ggshield_msg = scanner.get_scanner_info_message()
+    if ggshield_msg:
+        console.print(f"[dim]{ggshield_msg}[/dim]")
 
     # Scan with progress bar (Apple Intelligence glow style if available)
     if _UI_AVAILABLE:
@@ -651,6 +694,12 @@ def scan(
     is_flag=True,
     help="Also scan and fix untracked files (files not in git). Use with caution.",
 )
+@click.option(
+    "--fix-all",
+    "fix_all_flag",
+    is_flag=True,
+    help="Fix ALL findings regardless of LLM classification — including false positives.",
+)
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def fix(
     path: Path,
@@ -663,6 +712,7 @@ def fix(
     include_review: bool,
     llm: bool,
     include_untracked: bool,
+    fix_all_flag: bool,
 ):
     """Fix/remove detected secrets in working files and git history."""
     if not check_gitleaks_installed():
@@ -693,6 +743,12 @@ def fix(
                 "[yellow]ollama not installed. Run: pip install ollama[/yellow]"
             )
             llm_enabled = False
+
+    # Show warning for fix-all mode
+    if fix_all_flag:
+        console.print()
+        console.print("[bold yellow]⚠️  Fix-all mode: removing all findings including false positives[/bold yellow]")
+        console.print("[dim]This will fix .env.example, README.md examples, template files, etc.[/dim]")
 
     # Show progress for fix operation (Apple Intelligence glow style if available)
     console.print()
@@ -729,6 +785,7 @@ def fix(
             include_review=include_review,
             llm_enabled=llm_enabled,
             include_untracked=include_untracked,
+            fix_all_findings=fix_all_flag,
         )
         progress.update(task2, completed=1)
         progress.update(task3, completed=1)

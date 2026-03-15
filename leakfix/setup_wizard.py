@@ -62,6 +62,7 @@ def check_dependencies_only() -> dict:
     return {
         "gitleaks": check_dependency("gitleaks"),
         "git-filter-repo": check_dependency("git-filter-repo"),
+        "ggshield": check_dependency("ggshield"),
         "python3": check_dependency("python3"),
         "ollama": check_dependency("ollama"),
         "ollama_pip": _check_ollama_importable(),
