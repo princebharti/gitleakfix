@@ -32,3 +32,6 @@ leakfix = "leakfix.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["leakfix*"]
+
+[tool.setuptools.package-data]
+leakfix = ["prompts/*.txt"]

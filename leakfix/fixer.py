@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -14,6 +15,281 @@ from leakfix.utils import (
     get_repo_root,
     is_git_repo,
 )
+
+# Module-level cache for the fix prompt
+_FIX_PROMPT_CACHE: str | None = None
+
+# Fallback prompt if file not found
+_FALLBACK_FIX_PROMPT = """You are a security engineer. Replace this secret with a safe value.
+Secret: "{secret_value}"
+File: {file_path}
+Line {line_number}:
+{context_lines}
+
+Return JSON only: {"replacement": "<value>", "reason": "<why>", "confident": true/false}"""
+
+
+def _load_fix_prompt() -> str:
+    """
+    Load the fix prompt from leakfix/prompts/fix_secret.txt.
+    Falls back to a hardcoded minimal prompt if file not found.
+    Cached at module level after first load.
+    """
+    global _FIX_PROMPT_CACHE
+    if _FIX_PROMPT_CACHE is not None:
+        return _FIX_PROMPT_CACHE
+
+    # Try to load from package directory
+    prompt_path = Path(__file__).parent / "prompts" / "fix_secret.txt"
+    try:
+        if prompt_path.exists():
+            _FIX_PROMPT_CACHE = prompt_path.read_text(encoding="utf-8")
+            return _FIX_PROMPT_CACHE
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    # Fallback to hardcoded minimal prompt
+    _FIX_PROMPT_CACHE = _FALLBACK_FIX_PROMPT
+    return _FIX_PROMPT_CACHE
+
+
+def _get_llm_config() -> dict | None:
+    """Load LLM config from ~/.leakfix/config.json. Returns None if disabled or not found."""
+    config_path = Path.home() / ".leakfix" / "config.json"
+    try:
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if config.get("llm_enabled", False):
+                return config
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _get_context_lines(
+    file_path: Path,
+    line_number: int,
+    context: int = 5,
+    secret_value: str = "",
+    repo_root: Path | None = None,
+) -> str:
+    """
+    Read context lines around the secret line from the actual file.
+    Returns lines (line_number - context) to (line_number + context).
+    
+    If the secret is not found in the current file (history-only finding),
+    attempts to retrieve context from git history.
+    """
+    content = None
+    
+    # First try to read from the current file
+    try:
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+            # Check if the secret is actually in this file
+            if secret_value and secret_value not in content:
+                content = None  # Secret not in current file, try git history
+    except (OSError, UnicodeDecodeError):
+        pass
+    
+    # If secret not in current file, try git history
+    if content is None and repo_root and secret_value:
+        try:
+            # Get the relative path for git
+            try:
+                rel_path = file_path.relative_to(repo_root)
+            except ValueError:
+                rel_path = file_path
+            
+            # Find the commit that contains this secret
+            result = subprocess.run(
+                ["git", "log", "--all", "-p", "-S", secret_value, "--", str(rel_path)],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout:
+                # Extract the file content from the diff
+                # Find the commit hash first
+                import re
+                commit_match = re.search(r"^commit ([a-f0-9]+)", result.stdout, re.MULTILINE)
+                if commit_match:
+                    commit_hash = commit_match.group(1)
+                    # Get the file content at that commit
+                    show_result = subprocess.run(
+                        ["git", "show", f"{commit_hash}:{rel_path}"],
+                        cwd=str(repo_root),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if show_result.returncode == 0:
+                        content = show_result.stdout
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            pass
+    
+    if not content:
+        return ""
+    
+    try:
+        lines = content.splitlines()
+        
+        # If we got content from git history, we need to find the actual line number
+        # since it might differ from what the scanner reported
+        if secret_value:
+            for i, line in enumerate(lines):
+                if secret_value in line:
+                    line_number = i + 1
+                    break
+        
+        start = max(0, line_number - context - 1)
+        end = min(len(lines), line_number + context)
+        context_lines = []
+        for i in range(start, end):
+            prefix = ">>> " if i == line_number - 1 else "    "
+            context_lines.append(f"{prefix}{i + 1}: {lines[i]}")
+        return "\n".join(context_lines)
+    except Exception:
+        return ""
+
+
+def _intelligent_replacement(
+    secret_value: str,
+    file_path: str,
+    line_number: int,
+    rule_id: str,
+    repo_root: Path,
+) -> tuple[str, str | None, bool]:
+    """
+    Use LLM to generate an intelligent replacement for a secret.
+    
+    Returns:
+        tuple of (replacement_value, reason, used_llm)
+        - replacement_value: the string to replace the secret with
+        - reason: explanation from LLM (None if fallback used)
+        - used_llm: True if LLM was used successfully, False if fallback
+    """
+    # Check if LLM is enabled
+    config = _get_llm_config()
+    if not config:
+        return _safe_replacement(rule_id), None, False
+
+    # Get file extension
+    full_path = repo_root / file_path
+    extension = full_path.suffix.lstrip(".") if full_path.suffix else "unknown"
+
+    # Get context lines from the actual file (or git history for history-only findings)
+    context_lines = _get_context_lines(
+        full_path, line_number, context=5, secret_value=secret_value, repo_root=repo_root
+    )
+    if not context_lines:
+        return _safe_replacement(rule_id), None, False
+
+    # Load and format the prompt using safe string replacement
+    # (can't use .format() because context_lines may contain {VAR:-value} patterns)
+    prompt_template = _load_fix_prompt()
+    prompt = prompt_template.replace("{file_path}", file_path)
+    prompt = prompt.replace("{extension}", extension)
+    prompt = prompt.replace("{secret_value}", secret_value)
+    prompt = prompt.replace("{line_number}", str(line_number))
+    prompt = prompt.replace("{context_lines}", context_lines)
+
+    # Call Ollama with timeout
+    try:
+        import ollama
+        
+        model = config.get("llm_model", "qwen3-coder:30b")
+        base_url = config.get("llm_base_url", "http://localhost:11434")
+        
+        # Create client with base URL
+        client = ollama.Client(host=base_url)
+        
+        # Call with timeout (ollama client doesn't have native timeout, use subprocess fallback)
+        import threading
+        result_container: dict = {}
+        error_container: dict = {}
+        
+        def call_llm():
+            try:
+                response = client.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.1},
+                )
+                result_container["response"] = response
+            except Exception as e:
+                error_container["error"] = e
+        
+        thread = threading.Thread(target=call_llm)
+        thread.start()
+        thread.join(timeout=10.0)  # 10 second timeout
+        
+        if thread.is_alive():
+            # Timeout - fall back to safe replacement
+            return _safe_replacement(rule_id), None, False
+        
+        if "error" in error_container:
+            return _safe_replacement(rule_id), None, False
+        
+        if "response" not in result_container:
+            return _safe_replacement(rule_id), None, False
+        
+        response = result_container["response"]
+        response_text = response.get("message", {}).get("content", "")
+        
+        # Parse JSON response
+        # Handle potential markdown code blocks
+        response_text = response_text.strip()
+        if response_text.startswith("```"):
+            # Remove markdown code block
+            lines = response_text.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            response_text = "\n".join(lines)
+        
+        # Parse JSON
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            return _safe_replacement(rule_id), None, False
+        
+        # Validate response structure
+        if not isinstance(result, dict):
+            return _safe_replacement(rule_id), None, False
+        
+        replacement = result.get("replacement")
+        reason = result.get("reason")
+        confident = result.get("confident", False)
+        
+        # Validation checks
+        if replacement is None:
+            return _safe_replacement(rule_id), None, False
+        
+        # Must be a string
+        if not isinstance(replacement, str):
+            return _safe_replacement(rule_id), None, False
+        
+        # Must not contain the original secret
+        if secret_value in replacement:
+            return _safe_replacement(rule_id), None, False
+        
+        # Must be a single line
+        if "\n" in replacement:
+            return _safe_replacement(rule_id), None, False
+        
+        # If not confident, fall back
+        if not confident:
+            return _safe_replacement(rule_id), reason, False
+        
+        return replacement, reason, True
+        
+    except ImportError:
+        return _safe_replacement(rule_id), None, False
+    except Exception:
+        return _safe_replacement(rule_id), None, False
 
 
 def _is_binary_file(file_path: Path) -> bool:
@@ -202,6 +478,38 @@ class Fixer:
         # Count commits for summary (before rewrite)
         commit_count = self._count_commits()
 
+        # Pre-compute intelligent replacements for all findings
+        # Key: (secret_value, file, line) -> (replacement, reason, used_llm)
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] = {}
+        fix_logs: list[str] = []
+        
+        from rich.console import Console
+        console = Console()
+        
+        for f in findings:
+            key = (f.secret_value, f.file, f.line)
+            if key not in replacement_map:
+                if replace_with:
+                    # User specified explicit replacement
+                    replacement_map[key] = (replace_with, None, False)
+                else:
+                    # Use intelligent replacement
+                    replacement, reason, used_llm = _intelligent_replacement(
+                        f.secret_value, f.file, f.line, f.rule_id, self.repo_root
+                    )
+                    replacement_map[key] = (replacement, reason, used_llm)
+                    
+                    # Log which method was used
+                    display_secret = _mask_secret_for_display(f.secret_value)
+                    if used_llm and reason:
+                        fix_logs.append(f"✓ Fixed intelligently: \"{display_secret}\" → \"{replacement}\" ({reason})")
+                    else:
+                        fix_logs.append(f"✓ Fixed with placeholder: \"{display_secret}\" → \"{replacement}\"")
+
+        # Print fix logs
+        for log in fix_logs:
+            console.print(log)
+
         # BUG A FIX: Split findings into two separate lists BEFORE processing
         # Findings to write to disk — only tracked files (or all if include_untracked)
         tracked = self.scanner.get_tracked_files()
@@ -215,7 +523,7 @@ class Fixer:
         history_findings = findings  # no filter
 
         if not history_only:
-            self._fix_working_files(disk_findings, replace_with, confirm=False, include_untracked=include_untracked)
+            self._fix_working_files(disk_findings, replace_with, confirm=False, include_untracked=include_untracked, replacement_map=replacement_map)
             self._commit_changes("chore(security): remove secrets detected by leakfix")
 
         # Build skipped warnings for untracked files
@@ -233,7 +541,7 @@ class Fixer:
             remote, branch = self._get_remote_and_branch()
             remote_url = self._get_remote_url(remote) if remote else None
             # Use history_findings (all findings) for history rewrite, not just disk_findings
-            replacements_file = self._create_replacements_file(history_findings, replace_with)
+            replacements_file = self._create_replacements_file(history_findings, replace_with, replacement_map=replacement_map)
             try:
                 self._rewrite_history(replacements_file)
                 self._cleanup_reflog()
@@ -306,8 +614,15 @@ class Fixer:
         lines.append("")
         for f in findings:
             display_secret = _mask_secret_for_display(f.secret_value)
-            replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
-            lines.append(f"  {f.file}:{f.line} - {display_secret} → {replacement}")
+            if replace_with:
+                replacement = replace_with
+                method = ""
+            else:
+                replacement, reason, used_llm = _intelligent_replacement(
+                    f.secret_value, f.file, f.line, f.rule_id, self.repo_root
+                )
+                method = " (intelligent)" if used_llm else " (placeholder)"
+            lines.append(f"  {f.file}:{f.line} - {display_secret} → {replacement}{method}")
         if binary_files:
             lines.append("")
             lines.append(f"Binary files (manual action needed): {', '.join(sorted(binary_files))}")
@@ -366,6 +681,7 @@ class Fixer:
         replace_with: str,
         confirm: bool = False,
         include_untracked: bool = False,
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] | None = None,
     ) -> None:
         """Replace secrets in current working files."""
         # Group by file
@@ -397,8 +713,14 @@ class Fixer:
                 line_idx = f.line - 1
                 if 0 <= line_idx < len(lines):
                     old_line = lines[line_idx]
-                    # Determine replacement: use rule-specific if replace_with is empty
-                    actual_replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
+                    # Determine replacement: use pre-computed intelligent replacement if available
+                    key = (f.secret_value, f.file, f.line)
+                    if replacement_map and key in replacement_map:
+                        actual_replacement = replacement_map[key][0]
+                    elif replace_with:
+                        actual_replacement = replace_with
+                    else:
+                        actual_replacement = _safe_replacement(f.rule_id)
                     new_line = old_line.replace(f.secret_value, actual_replacement)
                     if new_line != old_line:
                         lines[line_idx] = new_line
@@ -421,21 +743,28 @@ class Fixer:
         self,
         findings: list[Finding],
         replace_with: str,
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] | None = None,
     ) -> Path | None:
         """Create replacements.txt for git-filter-repo. Format: literal:secret==>replacement"""
-        # Dedupe by (secret_value, rule_id) - same secret with same rule gets one replacement
-        # When replace_with is empty, use rule-specific safe replacement
-        secrets_seen: set[tuple[str, str]] = set()
+        # Dedupe by secret_value - same secret value gets one replacement
+        # git-filter-repo replaces ALL occurrences of the secret value in history
+        secrets_seen: set[str] = set()
         replacements: list[str] = []
         for f in findings:
-            key = (f.secret_value, f.rule_id if not replace_with else "")
-            if key not in secrets_seen:
-                secrets_seen.add(key)
+            if f.secret_value not in secrets_seen:
+                secrets_seen.add(f.secret_value)
                 escaped = _escape_for_replacements(f.secret_value)
                 # Skip unparseable secret values (empty or whitespace after escaping)
                 if not escaped.strip():
                     continue
-                actual_replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
+                # Determine replacement: use pre-computed intelligent replacement if available
+                key = (f.secret_value, f.file, f.line)
+                if replacement_map and key in replacement_map:
+                    actual_replacement = replacement_map[key][0]
+                elif replace_with:
+                    actual_replacement = replace_with
+                else:
+                    actual_replacement = _safe_replacement(f.rule_id)
                 replacements.append(f"literal:{escaped}==>{actual_replacement}")
         if not replacements:
             return None
