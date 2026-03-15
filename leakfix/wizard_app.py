@@ -361,6 +361,10 @@ LLM_MODELS = [
 class LeakfixWizardApp(App[dict | None]):
     """Textual wizard app for leakfix LLM setup."""
     
+    # For tracking installed models (used by button handler to skip download)
+    _installed_models: list[str]
+    _models_list: list[str]
+    
     CSS = """
 $primary: #BC82F3;
 $accent: #BC82F3;
@@ -463,9 +467,13 @@ OptionList > .option-item.selected {
 .button-row {
     layout: horizontal;
     height: auto;
-    margin: 2 0 3 0;
+    margin: 1 0 1 0;
     padding: 0;
     background: transparent;
+}
+
+#cancel-download {
+    margin: 0 0 0 0;
 }
 
 .bottom-spacer {
@@ -580,7 +588,13 @@ Label {
 
 #progress-detail {
     color: #6E6E73;
-    padding: 1 0;
+    padding: 0 0;
+}
+
+#progress-hint {
+    color: #6E6E73;
+    padding: 0 0 0 0;
+    margin: 0;
 }
 """
     
@@ -608,6 +622,9 @@ Label {
         self._progress_frame: int = 0
         self._progress_timer: Timer | None = None
         self._pull_process = None
+        # Track installed models and model list for button handler
+        self._installed_models: list[str] = []
+        self._models_list: list[str] = []
     
     def on_exception(self, error: Exception) -> None:
         import traceback, sys
@@ -717,39 +734,148 @@ Label {
         self.set_timer(0.1, self._focus_options)
     
     def _show_local_ollama_models(self) -> None:
-        """Show Ollama model selection."""
+        """Show Ollama model selection with async loading."""
         self._clear_content()
         self._current_screen = "model"
         self._selected_model = 0  # Default to first model index
         panel = self.query_one("#content-panel")
         
         self._mount_section_header(panel, "Local Ollama Models")
-        
         panel.mount(NFStatic("  Select a model:", classes="question-text"))
         
-        options = []
-        for i, (model, desc, recommended) in enumerate(LLM_MODELS):
-            label = f"◆  {model}   {desc}"
-            if recommended:
-                label += "  ← fastest"
+        # Step 1: Show loading state immediately (on main thread)
+        panel.mount(NFStatic("  [◆] Loading models...", id="models-loading"))
+        
+        # Step 2: Fetch data off the main thread
+        def _fetch_models():
+            installed_models: list[str] = []
+            fetched_models: list[tuple[str, str]] = []  # (name, description)
+            
+            # Try to get locally installed models via `ollama list`
+            try:
+                result = subprocess.run(
+                    ["ollama", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines[1:]:  # Skip header line
+                        if line.strip():
+                            parts = line.split()
+                            if parts:
+                                installed_models.append(parts[0])
+            except Exception:
+                pass
+            
+            # If installed models exist, use that list
+            if installed_models:
+                for model in installed_models:
+                    fetched_models.append((model, ""))
+            else:
+                # No installed models - try to fetch from ollama.com/library
+                try:
+                    import urllib.request
+                    import json
+                    
+                    req = urllib.request.Request(
+                        "https://ollama.com/library",
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        html = response.read().decode('utf-8')
+                        # Parse model names from the HTML
+                        # Look for patterns like href="/library/modelname"
+                        import re
+                        model_pattern = re.compile(r'href="/library/([a-zA-Z0-9._-]+)"')
+                        found_models = model_pattern.findall(html)
+                        # Get unique models, preserve order
+                        seen = set()
+                        for m in found_models:
+                            if m not in seen and m not in ('', 'search'):
+                                seen.add(m)
+                                fetched_models.append((m, ""))
+                                if len(fetched_models) >= 10:  # Limit to top 10
+                                    break
+                except Exception:
+                    pass
+                
+                # If HTTP fetch also failed, fall back to hardcoded LLM_MODELS
+                if not fetched_models:
+                    for model, desc, _ in LLM_MODELS:
+                        fetched_models.append((model, desc))
+            
+            # Step 3: Back on main thread, build and mount the OptionList
+            self.call_from_thread(
+                self._mount_model_options,
+                installed_models,
+                fetched_models
+            )
+        
+        threading.Thread(target=_fetch_models, daemon=True).start()
+    
+    def _mount_model_options(
+        self,
+        installed_models: list[str],
+        fetched_models: list[tuple[str, str]]
+    ) -> None:
+        """Mount the model OptionList after fetching (called from main thread)."""
+        # Store installed models for button handler
+        self._installed_models = installed_models
+        
+        # Remove the loading widget
+        try:
+            loading_widget = self.query_one("#models-loading")
+            loading_widget.remove()
+        except Exception:
+            pass
+        
+        panel = self.query_one("#content-panel")
+        current_model = self.config.get("llm_model", "")
+        
+        # Build option labels and model list
+        options: list[str] = []
+        self._models_list = []
+        
+        for model_name, description in fetched_models:
+            self._models_list.append(model_name)
+            
+            # Check if this is an installed model or fetched/fallback
+            if model_name in installed_models:
+                label = f"◆  {model_name}"
+                if model_name.lower() == current_model.lower():
+                    label += "   ← current"
+            else:
+                label = f"◆  {model_name}"
+                if description:
+                    label += f"   {description}"
+            
             options.append(label)
         
+        # Always append the "Enter a different model name..." option
         options.append("◆  Enter a different model name...")
+        self._models_list.append("")  # Empty string for custom option
         
+        # Mount OptionList and buttons
         panel.mount(OptionList(*options, id=self._option_id()))
-        
         panel.mount(Horizontal(
-            Button("Select →", id="model-continue"),
             Button("Back", id="back-to-provider", classes="secondary"),
+            Button("Select →", id="model-continue"),
             classes="button-row"
         ))
         
         self.set_timer(0.1, self._focus_options)
     
-    def _show_custom_model_input(self) -> None:
-        """Show custom model name input."""
+    def _show_custom_model_input(self, came_from: str = "provider") -> None:
+        """Show custom model name input.
+        
+        Args:
+            came_from: Where the user navigated from ("provider" or "model")
+        """
         self._clear_content()
         self._current_screen = "custom-model"
+        self._custom_model_came_from = came_from  # Store for back button
         panel = self.query_one("#content-panel")
         
         self._mount_section_header(panel, "Custom Ollama Model")
@@ -764,9 +890,11 @@ Label {
         self._validation_error_widget = NFStatic("", classes="error-text", id="validation-error")
         panel.mount(self._validation_error_widget)
         
+        # Back button goes to model list if came from there, otherwise provider
+        back_id = "back-to-model" if came_from == "model" else "back-to-provider"
         panel.mount(Horizontal(
+            Button("Back", id=back_id, classes="secondary"),
             Button("Pull & Configure →", id="custom-model-continue"),
-            Button("Back", id="back-to-provider", classes="secondary"),
             classes="button-row"
         ))
         self.set_timer(0.1, lambda: self.query_one("#custom-model-input", Input).focus())
@@ -1271,27 +1399,33 @@ Label {
             else:
                 self._show_enable_llm()
         
+        elif button_id == "back-to-model":
+            self._show_local_ollama_models()
+        
         elif button_id == "model-continue":
             idx = self._selected_model if isinstance(self._selected_model, int) else 0
-            if idx < len(LLM_MODELS):
-                model = LLM_MODELS[idx][0]
-                # Check if model is already installed
-                def _check_and_proceed_model():
-                    try:
-                        if _is_model_installed_locally(model):
-                            self.call_from_thread(self._show_already_installed, model)
-                        else:
-                            self.call_from_thread(self._show_download_progress, model)
-                    except Exception as e:
-                        import traceback
-                        with open("/tmp/wizard_crash.log", "a") as f:
-                            traceback.print_exc(file=f)
-                        self.call_from_thread(self._show_download_progress, model)
-                
-                threading.Thread(target=_check_and_proceed_model, daemon=True).start()
+            
+            # Check if it's the last option (Enter a different model name...)
+            if idx >= len(self._models_list) - 1 or self._models_list[idx] == "":
+                self._show_custom_model_input(came_from="model")
+                return
+            
+            # Look up the selected model name from _models_list
+            model = self._models_list[idx]
+            
+            # If model is in the locally installed list, skip download
+            if model in self._installed_models:
+                self._finish_with_config({
+                    **self.config,
+                    "llm_enabled": True,
+                    "llm_provider": "ollama",
+                    "llm_model": model,
+                    "llm_base_url": "http://localhost:11434",
+                    "llm_api_key": "",
+                })
             else:
-                # Last option is "Enter a different model name..."
-                self._show_custom_model_input()
+                # Model not installed, show download progress
+                self._show_download_progress(model)
         
         elif button_id == "custom-model-continue":
             try:
