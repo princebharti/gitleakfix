@@ -440,9 +440,10 @@ def _format_hook_mode(findings: list[Finding], dangerous_files: list[str], path:
     help="Filter findings by severity.",
 )
 @click.option(
-    "--smart",
+    "--raw",
+    "raw_flag",
     is_flag=True,
-    help="Scan with false positive filtering (classify findings).",
+    help="Disable smart filtering, show all findings including false positives.",
 )
 @click.option(
     "--llm",
@@ -469,12 +470,14 @@ def scan(
     hook_mode: bool,
     output: str,
     severity: str | None,
-    smart: bool,
+    raw_flag: bool,
     llm: bool,
     include_untracked: bool,
     verbose: bool,
 ):
     """Scan repository for leaked secrets."""
+    smart = not raw_flag
+    
     if not check_gitleaks_installed():
         console.print("[red]gitleaks not found. Run: brew install gitleaks[/red]")
         sys.exit(2)
@@ -545,7 +548,7 @@ def scan(
         staged_files = HookManager.get_staged_files(repo_root)
         hook_mgr = HookManager(repo_root)
         dangerous_files = hook_mgr._check_dangerous_files(staged_files)
-        if smart and findings:
+        if findings:
             config = load_config()
             llm_enabled = _check_llm_setup() if llm else config.get("llm_enabled", False)
             if llm_enabled:
@@ -573,16 +576,14 @@ def scan(
         console.print("🔍 leakfix pre-commit scan\n[green]✓ No secrets or dangerous files[/green]\n")
         sys.exit(0)
 
-    if smart:
-        if not findings:
-            console.print("[green]No secrets found[/green]")
-            if has_commits(path) and not history and not scan_all_flag:
-                console.print(
-                    "[dim]No secrets in working directory. Run `leakfix scan --history` "
-                    "to check git history.[/dim]"
-                )
-            sys.exit(0)
-        # When smart and findings: fall through to classification below
+    if not findings:
+        console.print("[green]No secrets found[/green]")
+        if has_commits(path) and not history and not scan_all_flag:
+            console.print(
+                "[dim]No secrets in working directory. Run `leakfix scan --history` "
+                "to check git history.[/dim]"
+            )
+        sys.exit(0)
     config = load_config()
     llm_enabled = _check_llm_setup() if llm else config.get("llm_enabled", False)
     if llm_enabled:
@@ -695,10 +696,10 @@ def scan(
     help="Also scan and fix untracked files (files not in git). Use with caution.",
 )
 @click.option(
-    "--fix-all",
+    "--all",
     "fix_all_flag",
     is_flag=True,
-    help="Fix ALL findings regardless of LLM classification — including false positives.",
+    help="Fix ALL findings including false positives (bypasses smart filtering).",
 )
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def fix(
@@ -747,7 +748,7 @@ def fix(
     # Show warning for fix-all mode
     if fix_all_flag:
         console.print()
-        console.print("[bold yellow]⚠️  Fix-all mode: removing all findings including false positives[/bold yellow]")
+        console.print("[bold yellow]⚠️  --all mode: removing all findings including false positives[/bold yellow]")
         console.print("[dim]This will fix .env.example, README.md examples, template files, etc.[/dim]")
 
     # Show progress for fix operation (Apple Intelligence glow style if available)
@@ -811,22 +812,16 @@ def fix(
 
 
 @main.command("install-hook")
-@click.option(
-    "--smart",
-    is_flag=True,
-    help="Use smart classification (skip likely false positives in hook).",
-)
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
-def install_hook(path: Path, smart: bool):
+def install_hook(path: Path):
     """Install pre-commit hook to prevent secret leaks."""
     if not is_git_repo(path):
         console.print("[red]Not a git repository. Run from a git repo or specify a path.[/red]")
         sys.exit(2)
     mgr = HookManager(path)
-    if mgr.install_hook(smart=smart):
+    if mgr.install_hook(smart=True):
         msg = f"[green]Pre-commit hook installed at {mgr.pre_commit_path}[/green]"
-        if smart:
-            msg += " [dim](smart mode: skips likely false positives)[/dim]"
+        msg += " [dim](smart mode: skips likely false positives)[/dim]"
         console.print(msg)
         sys.exit(0)
     console.print("[red]Failed to install hook[/red]")
@@ -989,9 +984,15 @@ def _format_org_summary(results: list[RepoResult]) -> None:
     help="When used with --fix, fix locally but don't force push.",
 )
 @click.option(
-    "--smart",
+    "--raw",
+    "raw_flag",
     is_flag=True,
-    help="Filter findings with classifier (exclude likely false positives).",
+    help="Disable smart filtering, show all findings including false positives.",
+)
+@click.option(
+    "--llm",
+    is_flag=True,
+    help="Use LLM to classify findings (requires ollama).",
 )
 def scan_org(
     path_arg: Path | None,
@@ -1005,9 +1006,12 @@ def scan_org(
     exclude: str | None,
     parallel: int,
     no_push: bool,
-    smart: bool,
+    raw_flag: bool,
+    llm: bool,
 ):
     """Scan organization repositories for secrets."""
+    smart = not raw_flag
+    
     if not check_gitleaks_installed():
         console.print("[red]gitleaks not found. Run: brew install gitleaks[/red]")
         sys.exit(2)
@@ -1112,9 +1116,10 @@ def scan_org(
     help="Filter by commit author (substring match).",
 )
 @click.option(
-    "--smart",
+    "--raw",
+    "raw_flag",
     is_flag=True,
-    help="Include classification breakdown (CONFIRMED vs FALSE_POSITIVE).",
+    help="Disable smart filtering, show all findings including false positives.",
 )
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def report(
@@ -1123,9 +1128,11 @@ def report(
     output: Path | None,
     since: str | None,
     author: str | None,
-    smart: bool,
+    raw_flag: bool,
 ):
     """Generate report of detected secrets."""
+    smart = not raw_flag
+    
     if not check_gitleaks_installed():
         console.print("[red]gitleaks not found. Run: brew install gitleaks[/red]")
         sys.exit(2)
