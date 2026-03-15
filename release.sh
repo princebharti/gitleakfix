@@ -130,10 +130,6 @@ sed -i '' "s/^  sha256 \"[a-f0-9]*\"/  sha256 \"${SHA256}\"/" Formula/leakfix.rb
 grep "v$NEW_VERSION" Formula/leakfix.rb > /dev/null || die "URL update failed in formula"
 grep "$SHA256" Formula/leakfix.rb > /dev/null || die "sha256 update failed in formula"
 
-# Update resource blocks to match new dependencies
-log "Updating resource blocks..."
-brew update-python-resources "$GITHUB_USER/tap/leakfix" 2>&1 | grep -v "^==> Getting" || true
-
 git add Formula/leakfix.rb
 git commit -m "chore: bump leakfix to v$NEW_VERSION"
 git push origin main
@@ -148,7 +144,6 @@ rm -f /opt/homebrew/bin/leakfix
 log "Tapping and installing fresh..."
 brew tap princebharti/tap
 brew install princebharti/tap/leakfix
-brew link --overwrite leakfix 2>/dev/null || true
 
 log "Verifying installation..."
 command -v leakfix || die "leakfix binary not found after install"
