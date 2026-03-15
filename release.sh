@@ -122,9 +122,9 @@ OLD_VERSION=$(grep -o 'refs/tags/v[0-9.]*' Formula/leakfix.rb | head -1 | sed 's
 [[ -z "$OLD_VERSION" ]] && die "Could not read current version from Formula/leakfix.rb"
 log "Tap is currently at v$OLD_VERSION"
 
-# Update URL and sha256
-sed -i '' "s|refs/tags/v$OLD_VERSION|refs/tags/v$NEW_VERSION|g" Formula/leakfix.rb
-sed -i '' "s/^  sha256 \"[a-f0-9]*\"/  sha256 \"$SHA256\"/" Formula/leakfix.rb
+# Update URL and sha256 — include .tar.gz in pattern to avoid partial matches
+sed -i '' "s|refs/tags/v${OLD_VERSION}.tar.gz|refs/tags/v${NEW_VERSION}.tar.gz|g" Formula/leakfix.rb
+sed -i '' "s/^  sha256 \"[a-f0-9]*\"/  sha256 \"${SHA256}\"/" Formula/leakfix.rb
 
 # Verify the update landed
 grep "v$NEW_VERSION" Formula/leakfix.rb > /dev/null || die "URL update failed in formula"
