@@ -7,6 +7,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.table import Table
 
 from leakfix import __version__
@@ -31,6 +32,22 @@ from leakfix.utils import (
 )
 
 console = Console()
+
+# Import ui.py components with graceful fallback
+try:
+    from leakfix.ui import (
+        print_banner as _print_banner,
+        print_section_header,
+        print_success,
+        print_error,
+        print_warning,
+        glow_progress_kwargs,
+        APPLE_PURPLE, APPLE_BLUE_PURPLE, APPLE_PINK_RED,
+        APPLE_ORANGE, APPLE_VIOLET, APPLE_PINK,
+    )
+    _UI_AVAILABLE = True
+except ImportError:
+    _UI_AVAILABLE = False
 
 
 def _check_llm_setup() -> bool:
@@ -87,7 +104,7 @@ def _format_table(findings: list[Finding]) -> None:
         header_style="bold",
         border_style="dim",
     )
-    table.add_column("File", style="cyan")
+    table.add_column("File", style="#8D9FFF")
     table.add_column("Secret Type", style="yellow")
     table.add_column("Line", justify="right")
     table.add_column("Severity", style="red")
@@ -141,8 +158,16 @@ def _llm_display_name(cls: Classification) -> str:
     return cls.name
 
 
+AI_BANNER = """
+[bold]  [magenta]●[/magenta] [blue]●[/blue] [#8D9FFF]●[/#8D9FFF]  [bold white]leakfix[/bold white]  [dim]— intelligent secret detection[/dim][/bold]
+"""
+
 def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> None:
-    """Output format for --smart scan: grouped by classification."""
+    """Output format for --smart scan: grouped by classification with text badges."""
+    if _UI_AVAILABLE:
+        _print_banner()
+    else:
+        console.print(AI_BANNER)
     confirmed = [c for c in classified if c.classification == Classification.CONFIRMED]
     false_positives = [
         c for c in classified if c.classification == Classification.LIKELY_FALSE_POSITIVE
@@ -150,41 +175,42 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
     review_needed = [c for c in classified if c.classification == Classification.REVIEW_NEEDED]
 
     if confirmed:
-        console.print(f"\nCONFIRMED SECRETS ({len(confirmed)}):")
+        console.print(f"\n[bold red]  CONFIRMED SECRETS[/bold red] [dim]({len(confirmed)} found)[/dim]")
+        console.print("[magenta]" + "─" * 53 + "[/magenta]")
         for c in confirmed:
             masked = _mask_for_smart_display(c.finding.secret_value)
-            if "LLM (context-aware):" in c.reason:
-                console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
-                console.print(f"  🤖 {c.reason}")
-            elif "LLM classified" in c.reason:
-                console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
-                console.print(f"  🤖 {c.reason}")
-            else:
-                console.print(f"🔴 {c.finding.file}:{c.finding.line} — {c.finding.rule_id} ({masked})")
+            entropy = c.finding.entropy
+            severity = c.finding.severity.upper()
+            console.print(f"[bold red]REAL[/bold red]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
+            console.print(f"      Value: [bold]{masked}[/bold]  [dim]Entropy: {entropy:.2f}  Severity: {severity}[/dim]")
+            if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
+                console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
+            console.print()
 
     if false_positives:
-        console.print(f"\nLIKELY FALSE POSITIVES ({len(false_positives)}) — skipped:")
+        console.print(f"\n[bold #8D9FFF]  FALSE POSITIVES[/bold #8D9FFF] [dim]({len(false_positives)} skipped)[/dim]")
+        console.print("[#8D9FFF]" + "─" * 53 + "[/#8D9FFF]")
         for c in false_positives:
-            if "LLM (context-aware):" in c.reason:
-                console.print(f"⚪ {c.finding.file}:{c.finding.line} — {c.finding.rule_id}")
-                console.print(f"  🤖 {c.reason}")
-            elif "LLM classified" in c.reason:
-                console.print(
-                    f"⚪ {c.finding.file}:{c.finding.line} — {c.finding.rule_id}"
-                )
-                console.print(f"  🤖 {c.reason}")
+            if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
+                console.print(f"[dim]SKIP[/dim]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
+                console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
             else:
-                console.print(f"⚪ {c.finding.file}:{c.finding.line} — {c.reason}")
+                console.print(f"[dim]SKIP[/dim]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
 
     if review_needed:
-        console.print(f"\nREVIEW NEEDED ({len(review_needed)}):")
+        console.print(f"\n[bold yellow]  REVIEW NEEDED[/bold yellow] [dim]({len(review_needed)} items)[/dim]")
+        console.print("[yellow]" + "─" * 53 + "[/yellow]")
         for c in review_needed:
-            console.print(f"🟡 {c.finding.file}:{c.finding.line} — {c.reason}")
+            console.print(f"[yellow]WARN[/yellow]  [#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
 
+    console.print("\n[magenta]" + "─" * 53 + "[/magenta]")
     console.print(
-        f"\nSummary: {len(confirmed)} confirmed, "
-        f"{len(false_positives)} false positives, "
-        f"{len(review_needed)} needs review"
+        f"  [bold red]{len(confirmed)} confirmed[/bold red]"
+        f"  [dim]·[/dim]  "
+        f"[#8D9FFF]{len(false_positives)} skipped[/#8D9FFF]"
+        f"  [dim]·[/dim]  "
+        f"[yellow]{len(review_needed)} needs review[/yellow]"
+        f"  [dim]·[/dim]  [magenta]leakfix[/magenta]"
     )
 
 
@@ -265,6 +291,8 @@ def main():
 def setup(llm: bool, check: bool, reset: bool):
     """Interactive setup wizard."""
     if check:
+        from leakfix.setup_wizard import _get_installed_ollama_models
+
         status = check_dependencies_only()
         console.print("\nDependency status:")
         console.print(
@@ -283,6 +311,31 @@ def setup(llm: bool, check: bool, reset: bool):
             console.print("  Install: brew install git-filter-repo")
         if not status.get("ollama_pip"):
             console.print("  Install ollama Python: leakfix setup --llm")
+
+        # Show LLM configuration
+        config = load_config()
+        console.print("\nLLM configuration:")
+        provider = config.get("llm_provider", "ollama")
+        model = config.get("llm_model")
+        llm_enabled = config.get("llm_enabled", False)
+
+        console.print(f"  Provider : {provider}")
+        console.print(f"  Model    : {model or '(not configured)'}")
+
+        if llm_enabled:
+            if provider == "ollama":
+                models = _get_installed_ollama_models()
+                if models:
+                    console.print(f"  Status   : [green]✅ running ({len(models)} models installed)[/green]")
+                else:
+                    console.print("  Status   : [yellow]⚠️  ollama not running or no models[/yellow]")
+            else:
+                base_url = config.get("llm_base_url", "")
+                console.print(f"  Base URL : {base_url}")
+                console.print("  Status   : [dim]configured (OpenAI-compatible)[/dim]")
+        else:
+            console.print("  Status   : [dim]disabled[/dim]")
+
         core_ok = status["gitleaks"] and status["git-filter-repo"]
         sys.exit(0 if core_ok else 1)
 
@@ -363,6 +416,12 @@ def _format_hook_mode(findings: list[Finding], dangerous_files: list[str], path:
     is_flag=True,
     help="Include untracked/gitignored files in scan.",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Show detailed output including all skipped files.",
+)
 @click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
 def scan(
     path: Path,
@@ -375,6 +434,7 @@ def scan(
     smart: bool,
     llm: bool,
     include_untracked: bool,
+    verbose: bool,
 ):
     """Scan repository for leaked secrets."""
     if not check_gitleaks_installed():
@@ -388,21 +448,52 @@ def scan(
     repo_root = get_repo_root(path) or path
     scanner = Scanner(path)
 
-    if staged or hook_mode:
-        findings = scanner.scan_staged()
-    elif scan_all_flag:
-        working = scanner.scan_working_directory(include_untracked=include_untracked)
-        history_findings = scanner.scan_history()
-        findings = scanner._dedupe_findings(working + history_findings)
-    elif history:
-        findings = scanner.scan_history()
+    # Scan with progress bar (Apple Intelligence glow style if available)
+    if _UI_AVAILABLE:
+        _pkwargs = glow_progress_kwargs()
+        _columns = _pkwargs.pop("columns", None)
+        _progress_ctx = Progress(*_columns, console=console, **_pkwargs)
     else:
-        findings = scanner.scan_working_directory(include_untracked=include_untracked)
+        _progress_ctx = Progress(
+            SpinnerColumn(spinner_name="dots", style="bold magenta"),
+            TextColumn("[bold blue]{task.description}[/bold blue]"),
+            BarColumn(bar_width=40, style="magenta", complete_style="bold #8D9FFF"),
+            TaskProgressColumn(style="bold #8D9FFF"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+    with _progress_ctx as progress:
+        if staged or hook_mode:
+            task = progress.add_task("Scanning staged files...", total=None)
+            findings = scanner.scan_staged()
+            progress.update(task, completed=True)
+        elif scan_all_flag:
+            task1 = progress.add_task("Scanning working directory...", total=None)
+            working = scanner.scan_working_directory(include_untracked=include_untracked)
+            progress.update(task1, completed=True)
+            task2 = progress.add_task("Scanning git history...", total=None)
+            history_findings = scanner.scan_history()
+            progress.update(task2, completed=True)
+            findings = scanner._dedupe_findings(working + history_findings)
+        elif history:
+            task = progress.add_task("Scanning git history...", total=None)
+            findings = scanner.scan_history()
+            progress.update(task, completed=True)
+        else:
+            task = progress.add_task("Scanning repository...", total=None)
+            findings = scanner.scan_working_directory(include_untracked=include_untracked)
+            progress.update(task, completed=True)
 
-    # Show warnings for skipped untracked files
+    # Show warnings for skipped untracked files (compact summary or verbose)
     if scanner._untracked_files_warned and not include_untracked:
-        for f in sorted(scanner._untracked_files_warned):
-            console.print(f"[dim]⚠️  Skipped {f} (not tracked by git — safe to keep secrets here)[/dim]")
+        skipped_count = len(scanner._untracked_files_warned)
+        if verbose:
+            for f in sorted(scanner._untracked_files_warned):
+                console.print(f"[dim]  Skipped {f} (not tracked by git)[/dim]")
+        else:
+            console.print(f"[dim]{skipped_count} untracked files skipped (secrets safe — not in git)[/dim]")
+            console.print("[dim]  Run with --include-untracked to scan them too[/dim]")
 
     findings = _filter_by_severity(findings, severity)
 
@@ -461,7 +552,28 @@ def scan(
             llm_enabled = False
     if smart and findings:
         classifier = Classifier(repo_root)
-        classified = classifier.classify_findings(findings, llm_enabled)
+        # Classify with progress bar (Apple Intelligence glow style if available)
+        if _UI_AVAILABLE:
+            _pkwargs2 = glow_progress_kwargs()
+            _columns2 = _pkwargs2.pop("columns", None)
+            _classify_ctx = Progress(*_columns2, console=console, **_pkwargs2)
+        else:
+            _classify_ctx = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            )
+        with _classify_ctx as progress:
+            task = progress.add_task("Classifying findings...", total=len(findings))
+            classified = []
+            for finding in findings:
+                result = classifier.classify_finding(finding, llm_enabled)
+                classified.append(result)
+                progress.advance(task)
         _format_smart_scan(classified, repo_root)
         # Exit 1 if any confirmed (real secrets)
         if any(c.classification == Classification.CONFIRMED for c in classified):
@@ -581,24 +693,63 @@ def fix(
                 "[yellow]ollama not installed. Run: pip install ollama[/yellow]"
             )
             llm_enabled = False
-    fixer = Fixer(path)
-    success, message = fixer.fix_all(
-        dry_run=dry_run,
-        replace_with=replace_with,
-        no_push=no_push,
-        history_only=history_only,
-        files_only=files_only,
-        confirm=confirm,
-        include_review=include_review,
-        llm_enabled=llm_enabled,
-        include_untracked=include_untracked,
-    )
 
+    # Show progress for fix operation (Apple Intelligence glow style if available)
+    console.print()
+    if _UI_AVAILABLE:
+        from rich.progress import TextColumn as _TC, BarColumn as _BC, TimeElapsedColumn as _TE
+        _fix_ctx = Progress(
+            _TC(f"[bold {APPLE_BLUE_PURPLE}]{{task.description}}[/bold {APPLE_BLUE_PURPLE}]"),
+            _BC(bar_width=40, style=APPLE_PURPLE, complete_style=APPLE_BLUE_PURPLE, finished_style=APPLE_PINK),
+            _TE(),
+            console=console,
+            transient=False,
+        )
+    else:
+        _fix_ctx = Progress(
+            TextColumn("[bold blue]{task.description}[/bold blue]"),
+            BarColumn(bar_width=40, style="magenta", complete_style="bold #8D9FFF"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
+    with _fix_ctx as progress:
+        task1 = progress.add_task("Phase 1/3  Scanning for secrets...  ", total=1)
+        fixer = Fixer(path)
+        progress.update(task1, completed=1)
+        task2 = progress.add_task("Phase 2/3  Fixing files...          ", total=1)
+        task3 = progress.add_task("Phase 3/3  Rewriting git history... ", total=1)
+        success, message = fixer.fix_all(
+            dry_run=dry_run,
+            replace_with=replace_with,
+            no_push=no_push,
+            history_only=history_only,
+            files_only=files_only,
+            confirm=confirm,
+            include_review=include_review,
+            llm_enabled=llm_enabled,
+            include_untracked=include_untracked,
+        )
+        progress.update(task2, completed=1)
+        progress.update(task3, completed=1)
+
+    # Format output with new style
     if success:
-        console.print(f"[green]{message}[/green]")
+        if _UI_AVAILABLE:
+            print_success(message)
+        else:
+            if "secret(s) removed" in message:
+                console.print(f"\n[green]✓ {message}[/green]")
+            elif "No secrets found" in message or "No confirmed secrets" in message:
+                console.print(f"\n[green]✓ {message}[/green]")
+            else:
+                console.print(f"\n[green]{message}[/green]")
         sys.exit(0)
     else:
-        console.print(f"[red]{message}[/red]")
+        if _UI_AVAILABLE:
+            print_error(message)
+        else:
+            console.print(f"\n[red]✗ {message}[/red]")
         sys.exit(1)
 
 
@@ -689,9 +840,9 @@ def classify(value: str, file_path: str | None, llm: bool):
             llm_enabled = False
     classifier = Classifier()
     classification, reason = classifier.classify_value(value, file_path, llm_enabled)
-    if "LLM classified" in reason:
+    if "LLM classified" in reason or "LLM (context-aware):" in reason:
         loc = f"{file_path}:value" if file_path else "value"
-        console.print(f"🤖 LLM classified: {loc} → {_llm_display_name(classification)}")
+        console.print(f"[#8D9FFF]LLM[/#8D9FFF]  {loc} → {_llm_display_name(classification)}")
     console.print(f"Classification: {classification.name}")
     console.print(f"Reason: {reason}")
 

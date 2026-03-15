@@ -230,6 +230,29 @@ def _ask_model_choice() -> str:
     return LLM_MODELS[0][0]
 
 
+def _get_installed_ollama_models() -> list[str]:
+    """Get list of installed ollama models."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return []
+        models = []
+        for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+            if line.strip():
+                parts = line.split()
+                if parts:
+                    models.append(parts[0])
+        return models
+    except Exception:
+        return []
+
+
 def _print_quick_start() -> None:
     print("\n✅ leakfix ready!")
     print()
@@ -242,12 +265,10 @@ def _print_quick_start() -> None:
     print()
 
 
-def run_setup(llm_only: bool = False, reset: bool = False, check_only: bool = False) -> bool:
+def _run_questionary_wizard(llm_only: bool = False, reset: bool = False, check_only: bool = False) -> bool:
     """
-    Run the setup wizard. Returns True on success.
-    - llm_only: Skip to LLM setup only
-    - reset: Clear config and re-run full setup
-    - check_only: Skip LLM prompt (dependencies + quick start only)
+    Run the questionary-based setup wizard. Returns True on success.
+    This is the fallback when Textual is not available.
     """
     if check_only:
         _print_header()
@@ -347,3 +368,43 @@ def run_setup(llm_only: bool = False, reset: bool = False, check_only: bool = Fa
 
     _print_quick_start()
     return True
+
+
+def run_setup(llm_only: bool = False, reset: bool = False, check_only: bool = False) -> bool:
+    """
+    Run the setup wizard. Returns True on success.
+    - llm_only: Skip to LLM setup only
+    - reset: Clear config and re-run full setup
+    - check_only: Skip LLM prompt (dependencies + quick start only)
+    
+    Tries Textual wizard first, falls back to questionary if unavailable.
+    """
+    # Try Textual wizard first
+    try:
+        from leakfix.wizard_app import LeakfixWizardApp
+        
+        current_config = load_config()
+        if reset:
+            if CONFIG_FILE.exists():
+                CONFIG_FILE.unlink()
+            current_config = dict(DEFAULT_CONFIG)
+        
+        app = LeakfixWizardApp(
+            reset=reset,
+            llm_only=llm_only,
+            check_only=check_only,
+            current_config=current_config
+        )
+        result = app.run()
+        if result is not None:
+            save_config(result)
+            _print_quick_start()
+            return True
+        return False
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback to existing questionary wizard
+    return _run_questionary_wizard(llm_only=llm_only, reset=reset, check_only=check_only)

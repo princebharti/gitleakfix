@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leakfix"
-version = "1.1.0"
+version = "1.2.0"
 description = "One-stop CLI tool to detect, remove and prevent secrets in git repositories"
 readme = "README.md"
 license = {text = "MIT"}
@@ -16,9 +16,15 @@ dependencies = [
     "Jinja2>=3.0.0",
     "weasyprint>=60.0",
     "rich>=13.0.0",
+    "rich-gradient>=0.3.11",
     "GitPython>=3.1.0",
     "requests>=2.28.0",
+    "questionary>=2.0.0",
+    "textual>=0.60.0",
 ]
+
+[project.optional-dependencies]
+effects = ["terminaltexteffects>=0.11"]
 
 [project.scripts]
 leakfix = "leakfix.cli:main"

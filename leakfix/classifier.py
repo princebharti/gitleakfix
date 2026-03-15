@@ -95,9 +95,9 @@ TEMPLATE_PATH_SEGMENTS = (
 # Entropy threshold below which we consider low entropy
 ENTROPY_THRESHOLD = 3.0
 
-# High-confidence rules where _check_value_is_word_like should be bypassed
+# High-confidence rules where heuristic checks should be bypassed
 HIGH_CONFIDENCE_RULES = {
-    "aws-access-key", "aws-secret-key", "github-pat", "gitlab-pat",
+    "aws-access-key", "aws-secret-key", "aws-access-token", "github-pat", "gitlab-pat",
     "slack-token", "private-key", "private-key-pem", "openssh-private-key",
     "generic-sk-secret-key",
 }
@@ -200,7 +200,7 @@ class Classifier:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, placeholder_result)
 
         # Step 4: Constant/variable name (all caps, underscores, no special chars)
-        constant_result = self._check_constant_name(finding.secret_value)
+        constant_result = self._check_constant_name(finding.secret_value, finding.rule_id)
         if constant_result:
             return ClassifiedFinding(finding, Classification.LIKELY_FALSE_POSITIVE, constant_result)
 
@@ -320,8 +320,8 @@ class Classifier:
         if placeholder_result:
             return Classification.LIKELY_FALSE_POSITIVE, placeholder_result
 
-        # Step 4: Constant name
-        constant_result = self._check_constant_name(value)
+        # Step 4: Constant name (no rule_id available, use "generic")
+        constant_result = self._check_constant_name(value, "generic")
         if constant_result:
             return Classification.LIKELY_FALSE_POSITIVE, constant_result
 
@@ -438,8 +438,11 @@ class Classifier:
                 return "Secret appears in comment line"
         return None
 
-    def _check_constant_name(self, value: str) -> str | None:
+    def _check_constant_name(self, value: str, rule_id: str = "") -> str | None:
         """Check if value looks like a constant/variable name (all caps, underscores). Returns reason or None."""
+        # Bypass for high-confidence structured rules (AWS keys look like constants but are real)
+        if rule_id.lower() in HIGH_CONFIDENCE_RULES:
+            return None
         if len(value) < 3:
             return None
         # Must be alphanumeric + underscore only
@@ -486,34 +489,17 @@ class Classifier:
                 return f"File in test/example directory ({pattern})"
         return None
 
-    def _check_llm_classification(
+    def _build_classification_prompt(
         self,
         finding: Finding,
-        llm_enabled: bool,
-    ) -> tuple[Classification, str] | None:
-        """
-        Use ollama LLM to classify a finding with full code context.
-        Returns (Classification, reason) or None if ollama not installed.
-        """
-        try:
-            from ollama import Client
-        except ImportError:
-            _get_logger().info(
-                "ollama not found for current Python. Run: leakfix setup --llm"
-            )
-            return None
-
-        from leakfix.setup_wizard import load_config
-
-        config = load_config()
-        model = config.get("llm_model") or "qwen3:0.6b"
-
-        context_lines = self._load_context_lines(finding, window=15)
-        file_header = self._load_file_header(finding, n=5)
+        context_lines: str,
+        file_header: str,
+    ) -> str:
+        """Build the LLM prompt for classifying a finding."""
         file_extension = Path(finding.file).suffix
         file_name = Path(finding.file).name
 
-        prompt = f"""You are a senior security engineer reviewing code for leaked credentials.
+        return f"""You are a senior security engineer reviewing code for leaked credentials.
 
 ## Task
 Classify whether the detected value is a REAL credential or a PLACEHOLDER/EXAMPLE.
@@ -563,6 +549,37 @@ PLACEHOLDER
 Reason: File is .env.example and surrounding lines show other placeholder values like DB_HOST=localhost.
 """
 
+    def _parse_llm_verdict(self, text: str) -> tuple[Classification, str]:
+        """Parse LLM response text into Classification and reason."""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        verdict = lines[0].upper() if lines else ""
+        reason_line = next((l for l in lines if l.lower().startswith("reason:")), "")
+        reason = reason_line.replace("Reason:", "").replace("reason:", "").strip() or "LLM classified"
+
+        if "PLACEHOLDER" in verdict:
+            return Classification.LIKELY_FALSE_POSITIVE, f"LLM (context-aware): {reason}"
+        if "REAL" in verdict:
+            return Classification.CONFIRMED, f"LLM (context-aware): {reason}"
+        return Classification.REVIEW_NEEDED, "LLM gave ambiguous response"
+
+    def _check_llm_ollama(
+        self,
+        finding: Finding,
+        model: str,
+        context_lines: str,
+        file_header: str,
+    ) -> tuple[Classification, str] | None:
+        """Call ollama LLM to classify a finding."""
+        try:
+            from ollama import Client
+        except ImportError:
+            _get_logger().info(
+                "ollama not found for current Python. Run: leakfix setup --llm"
+            )
+            return None
+
+        prompt = self._build_classification_prompt(finding, context_lines, file_header)
+
         try:
             client = Client(host="http://localhost:11434", timeout=15.0)
             response = client.chat(
@@ -574,20 +591,80 @@ Reason: File is .env.example and surrounding lines show other placeholder values
             msg_content = msg.content if hasattr(msg, "content") else (msg.get("content") if isinstance(msg, dict) else "")
             text = (msg_content or "").strip()
         except Exception as e:
-            _get_logger().info("LLM unavailable: %s", e)
+            _get_logger().info("Ollama LLM unavailable: %s", e)
             return Classification.REVIEW_NEEDED, "LLM unavailable"
 
-        # Parse response — first non-empty line is REAL or PLACEHOLDER
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        verdict = lines[0].upper() if lines else ""
-        reason_line = next((l for l in lines if l.lower().startswith("reason:")), "")
-        reason = reason_line.replace("Reason:", "").replace("reason:", "").strip() or "LLM classified"
+        return self._parse_llm_verdict(text)
 
-        if "PLACEHOLDER" in verdict:
-            return Classification.LIKELY_FALSE_POSITIVE, f"LLM (context-aware): {reason}"
-        if "REAL" in verdict:
-            return Classification.CONFIRMED, f"LLM (context-aware): {reason}"
-        return Classification.REVIEW_NEEDED, "LLM gave ambiguous response"
+    def _check_llm_openai_compatible(
+        self,
+        finding: Finding,
+        config: dict,
+        model: str,
+        context_lines: str,
+        file_header: str,
+    ) -> tuple[Classification, str] | None:
+        """Call an OpenAI-compatible local server."""
+        import json
+        import urllib.request
+        import urllib.error
+
+        base_url = config.get("llm_base_url", "http://localhost:1234/v1")
+        api_key = config.get("llm_api_key", "") or "not-required"
+
+        prompt = self._build_classification_prompt(finding, context_lines, file_header)
+
+        try:
+            payload = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0,
+            }).encode()
+            req = urllib.request.Request(
+                f"{base_url.rstrip('/')}/chat/completions",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+                text = data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            _get_logger().info("OpenAI-compatible LLM unavailable: %s", e)
+            return Classification.REVIEW_NEEDED, "LLM unavailable"
+
+        return self._parse_llm_verdict(text)
+
+    def _check_llm_classification(
+        self,
+        finding: Finding,
+        llm_enabled: bool,
+    ) -> tuple[Classification, str] | None:
+        """
+        Use LLM to classify a finding with full code context.
+        Routes to appropriate provider based on config.
+        Returns (Classification, reason) or None if LLM not available.
+        """
+        from leakfix.setup_wizard import load_config
+
+        config = load_config()
+        provider = config.get("llm_provider", "ollama")
+        model = config.get("llm_model") or "qwen3:0.6b"
+
+        context_lines = self._load_context_lines(finding, window=15)
+        file_header = self._load_file_header(finding, n=5)
+
+        if provider == "openai_compatible":
+            return self._check_llm_openai_compatible(
+                finding, config, model, context_lines, file_header
+            )
+        else:
+            return self._check_llm_ollama(
+                finding, model, context_lines, file_header
+            )
 
     def _check_tool_placeholder_patterns(self, value: str) -> str | None:
         """Check known placeholder patterns for specific tools. Returns reason or None."""

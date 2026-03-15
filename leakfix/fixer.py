@@ -37,10 +37,21 @@ def _mask_secret_for_display(secret: str, max_visible: int = 7) -> str:
 
 
 def _escape_for_replacements(secret: str) -> str:
-    """Escape special regex characters for literal matching in git-filter-repo."""
-    # git-filter-repo literal: treats the string as literal, but we need to
-    # escape any ==> in the secret itself to avoid being parsed as delimiter
-    return secret.replace("==>", "\\==>")
+    """
+    Escape special characters for git-filter-repo replacements file.
+    Format: literal:SECRET==>REPLACEMENT
+    Special chars that need handling:
+    - ==> : the delimiter itself
+    - newlines : would break the line-per-rule format
+    - null bytes : would corrupt the file
+    """
+    # Escape the delimiter first
+    result = secret.replace("==>", "\\==>")
+    # Replace newlines with space (git-filter-repo treats each line as one rule)
+    result = result.replace("\n", " ").replace("\r", "")
+    # Replace null bytes
+    result = result.replace("\x00", "")
+    return result
 
 
 def _safe_replacement(rule_id: str) -> str:
@@ -182,8 +193,20 @@ class Fixer:
         # Count commits for summary (before rewrite)
         commit_count = self._count_commits()
 
+        # BUG A FIX: Split findings into two separate lists BEFORE processing
+        # Findings to write to disk — only tracked files (or all if include_untracked)
+        tracked = self.scanner.get_tracked_files()
+        disk_findings = [
+            f for f in findings
+            if include_untracked or f.file in tracked
+        ]
+
+        # Findings for history rewrite — ALL findings regardless of tracking status
+        # A file may be untracked now but WAS in history — must still clean history
+        history_findings = findings  # no filter
+
         if not history_only:
-            self._fix_working_files(findings, replace_with, confirm=False, include_untracked=include_untracked)
+            self._fix_working_files(disk_findings, replace_with, confirm=False, include_untracked=include_untracked)
             self._commit_changes("chore(security): remove secrets detected by leakfix")
 
         # Build skipped warnings for untracked files
@@ -200,7 +223,8 @@ class Fixer:
             # Save remote URL BEFORE git-filter-repo removes it
             remote, branch = self._get_remote_and_branch()
             remote_url = self._get_remote_url(remote) if remote else None
-            replacements_file = self._create_replacements_file(findings, replace_with)
+            # Use history_findings (all findings) for history rewrite, not just disk_findings
+            replacements_file = self._create_replacements_file(history_findings, replace_with)
             try:
                 self._rewrite_history(replacements_file)
                 self._cleanup_reflog()
@@ -383,6 +407,9 @@ class Fixer:
             if key not in secrets_seen:
                 secrets_seen.add(key)
                 escaped = _escape_for_replacements(f.secret_value)
+                # Skip unparseable secret values (empty or whitespace after escaping)
+                if not escaped.strip():
+                    continue
                 actual_replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
                 replacements.append(f"literal:{escaped}==>{actual_replacement}")
         if not replacements:
