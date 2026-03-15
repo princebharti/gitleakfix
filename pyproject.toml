@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leakfix"
-version = "1.2.0"
+version = "1.3.0"
 description = "One-stop CLI tool to detect, remove and prevent secrets in git repositories"
 readme = "README.md"
 license = {text = "MIT"}
