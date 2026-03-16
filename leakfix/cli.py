@@ -994,6 +994,11 @@ def _format_org_summary(results: list[RepoResult]) -> None:
     is_flag=True,
     help="Use LLM to classify findings (requires ollama).",
 )
+@click.option(
+    "--history",
+    is_flag=True,
+    help="Scan full git history in addition to working directory.",
+)
 def scan_org(
     path_arg: Path | None,
     gitlab: str | None,
@@ -1008,6 +1013,7 @@ def scan_org(
     no_push: bool,
     raw_flag: bool,
     llm: bool,
+    history: bool,
 ):
     """Scan organization repositories for secrets."""
     smart = not raw_flag
@@ -1045,15 +1051,15 @@ def scan_org(
     if mode == "directory":
         path_resolved = Path(path_arg).expanduser().resolve()
         results = scanner.scan_directory(
-            path_resolved, exclude=exclude_list, parallel=parallel, smart=smart
+            path_resolved, exclude=exclude_list, parallel=parallel, smart=smart, scan_history=history
         )
     elif mode == "gitlab":
         results = scanner.scan_gitlab(
-            gitlab, token, group, exclude=exclude_list, smart=smart
+            gitlab, token, group, exclude=exclude_list, smart=smart, scan_history=history
         )
     else:
         results = scanner.scan_github(
-            token, org, exclude=exclude_list, smart=smart
+            token, org, exclude=exclude_list, smart=smart, scan_history=history
         )
 
     if not results:

@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from leakfix.classifier import Classification, Classifier
 from leakfix.scanner import Finding, Scanner
@@ -41,6 +40,7 @@ class OrgScanner:
         exclude: list[str] | None = None,
         parallel: int = 2,
         smart: bool = False,
+        scan_history: bool = False,
     ) -> list[RepoResult]:
         """Scan all git repos under a directory."""
         path = Path(path).resolve()
@@ -49,7 +49,7 @@ class OrgScanner:
         exclude_set = set((exclude or []))
         repos = self._find_git_repos(path)
         repos = [r for r in repos if Path(r).name not in exclude_set]
-        return self._scan_repos_parallel(repos, parallel, smart=smart)
+        return self._scan_repos_parallel(repos, parallel, smart=smart, scan_history=scan_history)
 
     def scan_gitlab(
         self,
@@ -58,12 +58,13 @@ class OrgScanner:
         group: str,
         exclude: list[str] | None = None,
         smart: bool = False,
+        scan_history: bool = False,
     ) -> list[RepoResult]:
         """Scan all repos in a GitLab group by cloning temporarily."""
         exclude_set = set((exclude or []))
         repo_urls = self._list_gitlab_repos(url, token, group)
         repo_urls = [(u, n) for u, n in repo_urls if n not in exclude_set]
-        return self._scan_cloned_repos(repo_urls, smart=smart)
+        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history)
 
     def scan_github(
         self,
@@ -71,12 +72,13 @@ class OrgScanner:
         org: str,
         exclude: list[str] | None = None,
         smart: bool = False,
+        scan_history: bool = False,
     ) -> list[RepoResult]:
         """Scan all repos in a GitHub org by cloning temporarily."""
         exclude_set = set((exclude or []))
         repo_urls = self._list_github_repos(token, org)
         repo_urls = [(u, n) for u, n in repo_urls if n not in exclude_set]
-        return self._scan_cloned_repos(repo_urls, smart=smart)
+        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history)
 
     def _find_git_repos(self, path: Path) -> list[Path]:
         """Recursively find all git repos under a directory."""
@@ -94,13 +96,16 @@ class OrgScanner:
                 repos.extend(self._find_git_repos(entry))
         return repos
 
-    def _scan_repo(self, repo_path: Path, smart: bool = False) -> RepoResult:
+    def _scan_repo(self, repo_path: Path, smart: bool = False, scan_history: bool = False) -> RepoResult:
         """Scan a single repo and return RepoResult."""
         repo_path = Path(repo_path).resolve()
         repo_name = repo_path.name
         try:
             scanner = Scanner(repo_path)
-            findings = scanner.scan_all()
+            if scan_history:
+                findings = scanner.scan_all()  # working dir + history
+            else:
+                findings = scanner.scan_working_directory()  # working dir only
             if smart and findings:
                 classifier = Classifier(repo_path)
                 classified = classifier.classify_findings(findings)
@@ -128,37 +133,35 @@ class OrgScanner:
         repo_paths: list[Path],
         parallel: int,
         smart: bool = False,
+        scan_history: bool = False,
     ) -> list[RepoResult]:
-        """Scan multiple repos in parallel with progress bar."""
+        """Scan multiple repos in parallel with per-repo progress lines."""
         results: list[RepoResult] = []
         total = len(repo_paths)
         if total == 0:
             return results
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                "Scanning organization repositories...",
-                total=total,
-            )
-            with ThreadPoolExecutor(max_workers=parallel) as executor:
-                future_to_repo = {
-                    executor.submit(self._scan_repo, p, smart): p for p in repo_paths
-                }
-                for future in as_completed(future_to_repo):
-                    repo_path = future_to_repo[future]
-                    result = future.result()
-                    results.append(result)
-                    progress.update(
-                        task,
-                        advance=1,
-                        description=f"Scanning... {repo_path.name}",
-                    )
+        console.print(f"[dim]Scanning {total} repositories...[/dim]\n")
+        
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            future_to_repo = {
+                executor.submit(self._scan_repo, p, smart, scan_history): p for p in repo_paths
+            }
+            for future in as_completed(future_to_repo):
+                repo_path = future_to_repo[future]
+                result = future.result()
+                results.append(result)
+                
+                # Print each repo on its own line as it completes
+                repo_name = repo_path.name
+                if result.error:
+                    console.print(f"Scanning... {repo_name:<40} [red]❌ {result.error}[/red]")
+                elif result.findings:
+                    console.print(f"Scanning... {repo_name:<40} [yellow]⚠️  {len(result.findings)} secret(s)[/yellow]")
+                else:
+                    console.print(f"Scanning... {repo_name:<40} [green]✅[/green]")
+        
+        console.print()
         return results
 
     def _list_gitlab_repos(self, base_url: str, token: str, group: str) -> list[tuple[str, str]]:
@@ -256,6 +259,7 @@ class OrgScanner:
         self,
         repo_urls: list[tuple[str, str]],
         smart: bool = False,
+        scan_history: bool = False,
     ) -> list[RepoResult]:
         """Clone each repo, scan it, then clean up."""
         results: list[RepoResult] = []
@@ -263,37 +267,38 @@ class OrgScanner:
         if total == 0:
             return results
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                "Scanning organization repositories...",
-                total=total,
-            )
-            for url, name in repo_urls:
-                with tempfile.TemporaryDirectory(prefix="leakfix-org-") as tmp:
-                    clone_path = Path(tmp) / name
-                    clone_path.mkdir(parents=True, exist_ok=True)
-                    cloned = self._clone_repo(url, clone_path)
-                    if cloned:
-                        result = self._scan_repo(cloned, smart=smart)
-                        result.repo_name = name
-                        result.repo_path = url
-                        results.append(result)
+        console.print(f"[dim]Scanning {total} repositories...[/dim]\n")
+        
+        for url, name in repo_urls:
+            with tempfile.TemporaryDirectory(prefix="leakfix-org-") as tmp:
+                clone_path = Path(tmp) / name
+                clone_path.mkdir(parents=True, exist_ok=True)
+                cloned = self._clone_repo(url, clone_path)
+                if cloned:
+                    result = self._scan_repo(cloned, smart=smart, scan_history=scan_history)
+                    result.repo_name = name
+                    result.repo_path = url
+                    results.append(result)
+                    
+                    # Print each repo on its own line as it completes
+                    if result.error:
+                        console.print(f"Scanning... {name:<40} [red]❌ {result.error}[/red]")
+                    elif result.findings:
+                        console.print(f"Scanning... {name:<40} [yellow]⚠️  {len(result.findings)} secret(s)[/yellow]")
                     else:
-                        results.append(
-                            RepoResult(
-                                repo_path=url,
-                                repo_name=name,
-                                findings=[],
-                                error="Failed to clone",
-                            )
+                        console.print(f"Scanning... {name:<40} [green]✅[/green]")
+                else:
+                    results.append(
+                        RepoResult(
+                            repo_path=url,
+                            repo_name=name,
+                            findings=[],
+                            error="Failed to clone",
                         )
-                progress.update(task, advance=1)
+                    )
+                    console.print(f"Scanning... {name:<40} [red]❌ Failed to clone[/red]")
+        
+        console.print()
         return results
 
     def _aggregate_results(self, results: list[RepoResult]) -> dict:

@@ -431,12 +431,12 @@ class Fixer:
         findings = text_findings
 
         # When fix_all_findings is True, skip classification and fix everything
+        classifier = Classifier(self.repo_root)  # always init for re-verify step later
         if fix_all_findings:
             # Fix all findings regardless of classification
             pass  # findings = text_findings (already set)
         else:
             # Classify and filter: only fix CONFIRMED (and REVIEW_NEEDED if include_review)
-            classifier = Classifier(self.repo_root)
             classified = classifier.classify_findings(findings, llm_enabled)
             fixable = [
                 c.finding
@@ -537,6 +537,12 @@ class Fixer:
             skipped_warnings = "\n" + "\n".join(skipped_lines)
 
         if not files_only:
+            # Warn about potentially protected branches before history rewrite
+            if not no_push:
+                protected = self._detect_protected_branches()
+                if protected:
+                    self._warn_protected_branches(protected, console)
+            
             # Save remote URL BEFORE git-filter-repo removes it
             remote, branch = self._get_remote_and_branch()
             remote_url = self._get_remote_url(remote) if remote else None
@@ -565,12 +571,17 @@ class Fixer:
         file_count = len({f.file for f in findings})
         secret_count = len(findings)
 
-        # Re-verify: use classifier so only CONFIRMED secrets count as failures
+        # Re-verify: check for remaining secrets
+        # When fix_all_findings=True, ANY remaining secret is a failure (no classification filtering)
+        # Otherwise, use classifier so only CONFIRMED secrets count as failures
         if files_only:
             remaining = self.scanner.scan_working_directory(include_untracked=include_untracked)
         else:
             remaining = self.scanner.scan_all(include_untracked=include_untracked)
         if remaining:
+            if fix_all_findings:
+                # In --all mode, any remaining secret is a failure (no classification filtering)
+                return False, f"Verification failed: {len(remaining)} secret(s) still present{skipped_warnings}"
             classified_remaining = classifier.classify_findings(remaining, llm_enabled)
             confirmed = [c for c in classified_remaining if c.classification == Classification.CONFIRMED]
             false_positives = [
@@ -845,6 +856,77 @@ class Fixer:
         if result.returncode != 0:
             return []
         return [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+
+    def _detect_protected_branches(self) -> list[str]:
+        """
+        Detect branches that are likely protected on the remote.
+        Returns list of branch names that may be protected.
+        
+        Note: We can't definitively detect protected branches without API access,
+        but we can warn about common protected branch patterns.
+        """
+        # Common protected branch names
+        protected_patterns = {"main", "master", "develop", "release", "production", "prod"}
+        
+        # Get remote branches
+        result = subprocess.run(
+            ["git", "branch", "-r", "--format=%(refname:short)"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        
+        remote_branches = [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+        
+        # Check which local branches have remote counterparts that might be protected
+        local_branches = self._get_all_local_branches()
+        potentially_protected = []
+        
+        for local in local_branches:
+            # Check if this branch name matches a protected pattern
+            if local.lower() in protected_patterns:
+                # Check if it has a remote counterpart
+                for remote in remote_branches:
+                    # remote format is "origin/branch" or "upstream/branch"
+                    if remote.endswith(f"/{local}"):
+                        potentially_protected.append(local)
+                        break
+        
+        return potentially_protected
+
+    def _warn_protected_branches(self, branches: list[str], console) -> bool:
+        """
+        Warn user about potentially protected branches before history rewrite.
+        Returns True if user should proceed, False if they should abort.
+        """
+        if not branches:
+            return True
+        
+        console.print()
+        console.print("[bold yellow]⚠️  WARNING: Potentially protected branches detected[/bold yellow]")
+        console.print()
+        console.print("The following branches may be protected on your remote:")
+        for branch in branches:
+            console.print(f"  • {branch}")
+        console.print()
+        console.print("[bold]Before proceeding, you may need to:[/bold]")
+        console.print()
+        console.print("[bold]GitLab:[/bold]")
+        console.print("  1. Go to Settings → Repository → Protected branches")
+        console.print("  2. Unprotect the branches listed above")
+        console.print("  3. Re-protect them after the push completes")
+        console.print()
+        console.print("[bold]GitHub:[/bold]")
+        console.print("  1. Go to Settings → Branches → Branch protection rules")
+        console.print("  2. Temporarily disable 'Allow force pushes' restriction")
+        console.print("  3. Or delete the protection rule and recreate after push")
+        console.print()
+        console.print("[dim]If push fails with 'protected branch' error, follow the steps above.[/dim]")
+        console.print()
+        
+        return True  # Continue with the operation
 
     def _force_push_all_branches(self) -> dict[str, str]:
         """
