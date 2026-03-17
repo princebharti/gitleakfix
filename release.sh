@@ -5,7 +5,7 @@ set -e
 LEAKFIX_DIR=~/Desktop/leakfix
 TAP_DIR=~/Desktop/homebrew-tap
 GITHUB_USER=princebharti
-REPO=leakfix
+REPO=gitleakfix
 # ──────────────────────────────────────────────────────────
 
 # Colors

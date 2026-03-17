@@ -1,6 +1,8 @@
-# Homebrew Tap for leakfix
+# GitLeakFix (CLI: leakfix)
 
-This is the official Homebrew tap for [leakfix](https://github.com/princebharti/leakfix) — a CLI tool to detect, remove, and prevent secrets in git repositories.
+GitLeakFix is a CLI tool to detect, remove, and prevent secrets in git repositories.
+
+Note: Repository name is gitleakfix, CLI command remains leakfix.
 
 ## Installation
 
@@ -28,7 +30,7 @@ leakfix requires these external tools (installed automatically as dependencies):
 
 ## More Information
 
-- [leakfix on GitHub](https://github.com/princebharti/leakfix)
+- [GitLeakFix on GitHub](https://github.com/princebharti/gitleakfix)
 - [leakfix on PyPI](https://pypi.org/project/leakfix/)
 
 ## License
