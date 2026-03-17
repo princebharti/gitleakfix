@@ -145,14 +145,19 @@ OLD_VERSION=$(grep -o 'refs/tags/v[0-9][0-9.]*[0-9]' Formula/leakfix.rb | head -
 log "Tap is currently at v$OLD_VERSION"
 
 # Update URL and sha256 — include .tar.gz in pattern to avoid partial matches
-sed -i '' "s|refs/tags/v${OLD_VERSION}.tar.gz|refs/tags/v${NEW_VERSION}.tar.gz|g" Formula/leakfix.rb
-sed -i '' "s/^  sha256 \"[a-f0-9]*\"/  sha256 \"${SHA256}\"/" Formula/leakfix.rb
+FORMULAS=(Formula/leakfix.rb)
+[[ -f Formula/gitleakfix.rb ]] && FORMULAS+=(Formula/gitleakfix.rb)
 
-# Verify the update landed
-grep "v$NEW_VERSION" Formula/leakfix.rb > /dev/null || die "URL update failed in formula"
-grep "$SHA256" Formula/leakfix.rb > /dev/null || die "sha256 update failed in formula"
+for f in "${FORMULAS[@]}"; do
+    sed -i '' "s|refs/tags/v${OLD_VERSION}.tar.gz|refs/tags/v${NEW_VERSION}.tar.gz|g" "$f"
+    sed -i '' "s/^  sha256 \"[a-f0-9]*\"/  sha256 \"${SHA256}\"/" "$f"
 
-git add Formula/leakfix.rb
+    # Verify the update landed
+    grep "v$NEW_VERSION" "$f" > /dev/null || die "URL update failed in $f"
+    grep "$SHA256" "$f" > /dev/null || die "sha256 update failed in $f"
+
+    git add "$f"
+done
 # Only commit if there's something to commit
 if [[ -n "$(git status --porcelain)" ]]; then
     git commit -m "chore: bump leakfix to v$NEW_VERSION"
@@ -163,24 +168,31 @@ fi
 
 # ─── Step 7: Clean reinstall to verify ───────────────────
 log "Cleaning up existing installation..."
+brew uninstall gitleakfix 2>/dev/null || true
 brew uninstall leakfix 2>/dev/null || true
 brew untap princebharti/tap 2>/dev/null || true
 rm -rf $(brew --cache)/downloads/*leakfix*
 rm -f /opt/homebrew/bin/leakfix
+rm -f /opt/homebrew/bin/gitleakfix
 
 log "Tapping and installing fresh..."
 brew tap princebharti/tap
-brew install princebharti/tap/leakfix
+brew install princebharti/tap/gitleakfix
 
 log "Verifying installation..."
 command -v leakfix || die "leakfix binary not found after install"
+command -v gitleakfix || die "gitleakfix binary not found after install"
 leakfix --help > /dev/null 2>&1 || die "leakfix --help failed"
+gitleakfix --help > /dev/null 2>&1 || die "gitleakfix --help failed"
 leakfix scan --help > /dev/null 2>&1 || die "leakfix scan --help failed"
 
 INSTALLED=$(leakfix --version | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
+INSTALLED_ALIAS=$(gitleakfix --version | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
 if [[ "$INSTALLED" == "$NEW_VERSION" ]]; then
     echo ""
     echo -e "${GREEN}✅ v$NEW_VERSION shipped successfully!${NC}"
 else
     die "Version mismatch after install. Expected $NEW_VERSION, got $INSTALLED"
 fi
+
+[[ "$INSTALLED_ALIAS" == "$NEW_VERSION" ]] || die "Version mismatch for gitleakfix alias. Expected $NEW_VERSION, got $INSTALLED_ALIAS"

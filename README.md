@@ -8,7 +8,7 @@ Note: Repository name is gitleakfix, CLI command remains leakfix.
 
 ```bash
 brew tap princebharti/tap
-brew install leakfix
+brew install gitleakfix
 ```
 
 ## Usage
@@ -19,6 +19,12 @@ After installation, run:
 leakfix --help
 leakfix setup      # Interactive setup wizard
 leakfix scan       # Scan current repo for secrets
+```
+
+You can also use `gitleakfix` as an alias to `leakfix`:
+
+```bash
+gitleakfix --help
 ```
 
 ## Requirements
