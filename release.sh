@@ -2,8 +2,28 @@
 set -e
 
 # ─── Config ───────────────────────────────────────────────
-LEAKFIX_DIR=~/Desktop/leakfix
-TAP_DIR=~/Desktop/homebrew-tap
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Allow overrides via env vars; default to paths relative to this script.
+LEAKFIX_DIR="${LEAKFIX_DIR:-$SCRIPT_DIR}"
+
+if [[ -z "${TAP_DIR:-}" ]]; then
+  CANDIDATE_TAP_DIRS=(
+    "$SCRIPT_DIR/homebrew-tap"
+    "$SCRIPT_DIR/../homebrew-tap"
+    "$LEAKFIX_DIR/../homebrew-tap"
+    "$PWD/homebrew-tap"
+    "$HOME/Desktop/homebrew-tap"
+  )
+  for d in "${CANDIDATE_TAP_DIRS[@]}"; do
+    if [[ -f "$d/Formula/leakfix.rb" ]]; then
+      TAP_DIR="$(cd "$d" && pwd)"
+      break
+    fi
+  done
+  TAP_DIR="${TAP_DIR:-$HOME/Desktop/homebrew-tap}"
+fi
+
 GITHUB_USER=princebharti
 REPO=gitleakfix
 # ──────────────────────────────────────────────────────────
@@ -26,8 +46,10 @@ done
 
 # ─── Preflight checks ─────────────────────────────────────
 log "Running preflight checks..."
-[[ -d "$LEAKFIX_DIR" ]] || die "LEAKFIX_DIR not found: $LEAKFIX_DIR"
-[[ -d "$TAP_DIR" ]]     || die "TAP_DIR not found: $TAP_DIR"
+log "LEAKFIX_DIR: $LEAKFIX_DIR"
+log "TAP_DIR:    $TAP_DIR"
+[[ -d "$LEAKFIX_DIR" ]] || die "LEAKFIX_DIR not found: $LEAKFIX_DIR (set LEAKFIX_DIR env var to override)"
+[[ -d "$TAP_DIR" ]]     || die "TAP_DIR not found: $TAP_DIR (set TAP_DIR env var to override)"
 command -v curl    >/dev/null 2>&1 || die "curl is required"
 command -v shasum  >/dev/null 2>&1 || die "shasum is required"
 command -v brew    >/dev/null 2>&1 || die "brew is required"
