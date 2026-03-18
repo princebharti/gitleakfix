@@ -822,6 +822,16 @@ class Fixer:
         """Run git-filter-repo to rewrite history."""
         if not replacements_file or not replacements_file.exists():
             return
+
+        # Avoid git-filter-repo interactive continuation prompt when the marker
+        # from an old run exists (>24h). This keeps leakfix non-interactive.
+        already_ran = self.repo_root / ".git" / "filter-repo" / "already_ran"
+        if already_ran.exists():
+            try:
+                already_ran.unlink()
+            except OSError:
+                pass
+
         subprocess.run(
             ["git-filter-repo", "--replace-text", str(replacements_file), "--force"],
             cwd=str(self.repo_root),
