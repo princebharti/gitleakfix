@@ -571,13 +571,13 @@ class Fixer:
         file_count = len({f.file for f in findings})
         secret_count = len(findings)
 
-        # Re-verify: check for remaining secrets
-        # When fix_all_findings=True, ANY remaining secret is a failure (no classification filtering)
-        # Otherwise, use classifier so only CONFIRMED secrets count as failures
+        # Re-verify with gitleaks-only for speed and deterministic local behavior.
+        # Running ggshield history scans here can add long delays after rewrite.
+        # When fix_all_findings=True, ANY remaining secret is a failure.
         if files_only:
-            remaining = self.scanner.scan_working_directory(include_untracked=include_untracked)
+            remaining = self._verify_with_gitleaks_only(include_untracked=include_untracked, files_only=True)
         else:
-            remaining = self.scanner.scan_all(include_untracked=include_untracked)
+            remaining = self._verify_with_gitleaks_only(include_untracked=include_untracked, files_only=False)
         if remaining:
             if fix_all_findings:
                 # In --all mode, any remaining secret is a failure (no classification filtering)
@@ -607,6 +607,31 @@ class Fixer:
             summary += f"\n{push_summary}"
         summary += skipped_warnings
         return True, summary
+
+    def _verify_with_gitleaks_only(
+        self,
+        include_untracked: bool = False,
+        files_only: bool = False,
+    ) -> list[Finding]:
+        """
+        Fast post-fix verification path using gitleaks only.
+        This avoids an extra full ggshield repo scan that can look like a hang.
+        """
+        working = self.scanner._run_gitleaks(["detect", "--no-git"])
+        working = self.scanner._filter_ignored(working)
+        working = self.scanner._dedupe_findings(working)
+
+        if not include_untracked:
+            tracked = self.scanner.get_tracked_files()
+            if tracked:
+                working = [f for f in working if f.file in tracked]
+
+        if files_only:
+            return working
+
+        history = self.scanner._run_gitleaks(["detect"])
+        history = self.scanner._filter_ignored(history)
+        return self.scanner._dedupe_findings(working + history)
 
     def _dry_run_output(
         self,
