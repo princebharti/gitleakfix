@@ -20,13 +20,30 @@ from leakfix.utils import (
 _FIX_PROMPT_CACHE: str | None = None
 
 # Fallback prompt if file not found
-_FALLBACK_FIX_PROMPT = """You are a security engineer. Replace this secret with a safe value.
+_FALLBACK_FIX_PROMPT = """You are a security engineer fixing a hardcoded secret.
+File: {file_path} ({extension})
 Secret: "{secret_value}"
-File: {file_path}
 Line {line_number}:
 {context_lines}
 
-Return JSON only: {"replacement": "<value>", "reason": "<why>", "confident": true/false}"""
+Choose strategy: "env_ref" for source code (use language-native env var access), "empty" for .env files, "placeholder" for config files.
+Return JSON ONLY: {"strategy": "env_ref|empty|placeholder", "replacement": "<value>", "strip_quotes": true/false, "env_var_name": "<VAR>", "reason": "<why>", "confident": true/false}"""
+
+
+# Default LLM timeout for fix requests (seconds). Larger than classification timeout
+# because fix requests use larger models and require more reasoning.
+_LLM_FIX_TIMEOUT_SECONDS = 60
+
+# Source code file extensions that should use env_ref strategy
+_SOURCE_CODE_EXTENSIONS = {
+    "py", "js", "ts", "jsx", "tsx", "go", "rb", "java", "kt", "cs", "cpp",
+    "c", "h", "php", "rs", "swift", "scala", "groovy", "lua", "r", "pl",
+    "sh", "bash", "zsh", "fish",
+}
+
+# Env file extensions/names that should use empty strategy
+_ENV_FILE_PATTERNS = {".env", "env", "env.local", "env.development", "env.production",
+                      "env.staging", "env.test"}
 
 
 def _load_fix_prompt() -> str:
@@ -154,26 +171,144 @@ def _get_context_lines(
         return ""
 
 
+def _strip_think_tags(text: str) -> str:
+    """
+    Strip <think>...</think> blocks from LLM output.
+    qwen3 and similar reasoning models emit a thinking block before the actual response.
+    We want only the JSON output after the thinking block.
+    """
+    import re
+    # Remove <think>...</think> blocks (including multiline)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def _sanitize_json_for_parse(text: str) -> str:
+    """
+    Pre-process LLM JSON output to handle common model quirks:
+    - Replace backtick-quoted string values with double-quoted ones.
+      Some models (especially for Go code) write: "replacement": `os.Getenv("KEY")`
+      which is valid Go syntax but invalid JSON.
+    """
+    import re
+    # Replace backtick string values: `: `...`` → `: "..."` (escape inner double-quotes)
+    def replace_backtick(m: "re.Match[str]") -> str:
+        inner = m.group(1).replace("\\", "\\\\").replace('"', '\\"')
+        return f': "{inner}"'
+    text = re.sub(r":\s*`([^`]*)`", replace_backtick, text)
+    return text
+
+
+def _extract_json_from_response(text: str) -> dict | None:
+    """
+    Extract JSON object from LLM response text.
+    Handles:
+    - Raw JSON
+    - JSON wrapped in markdown code blocks (```json ... ```)
+    - JSON after <think>...</think> reasoning blocks
+    - JSON buried in explanatory text (finds first {...} block)
+    - Backtick-quoted string values (Go/shell code in JSON responses)
+    """
+    import re
+    # First strip thinking blocks
+    text = _strip_think_tags(text)
+    text = text.strip()
+
+    # Try raw JSON first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strip markdown code blocks
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove opening fence (```json, ```JSON, ```, etc.)
+        lines = lines[1:]
+        # Remove closing fence
+        while lines and lines[-1].strip() in ("```", "~~~"):
+            lines.pop()
+        text = "\n".join(lines).strip()
+
+    # Sanitize backtick values before parsing
+    sanitized = _sanitize_json_for_parse(text)
+    try:
+        return json.loads(sanitized)
+    except json.JSONDecodeError:
+        pass
+
+    # Find the first {...} block in the text (handles LLM preamble/postamble)
+    match = re.search(r"\{[^{}]*\}", sanitized, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Last resort: try original text with backtick fix
+    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if match:
+        sanitized_match = _sanitize_json_for_parse(match.group(0))
+        try:
+            return json.loads(sanitized_match)
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _infer_strategy_from_path(file_path: str) -> str:
+    """
+    Infer the appropriate fix strategy from file path when LLM is unavailable.
+    Returns 'empty', 'env_ref', or 'placeholder'.
+    """
+    p = Path(file_path)
+    name = p.name.lower()
+    ext = p.suffix.lstrip(".").lower()
+
+    # .env files → empty value
+    if name.startswith(".env") or name in ("env", ".env"):
+        return "empty"
+
+    # Source code → env_ref (but we can't generate code without LLM, so fall back to placeholder)
+    if ext in _SOURCE_CODE_EXTENSIONS:
+        return "placeholder"
+
+    return "placeholder"
+
+
 def _intelligent_replacement(
     secret_value: str,
     file_path: str,
     line_number: int,
     rule_id: str,
     repo_root: Path,
-) -> tuple[str, str | None, bool]:
+) -> tuple[str, str | None, bool, bool]:
     """
-    Use LLM to generate an intelligent replacement for a secret.
-    
+    Use LLM to generate an intelligent, context-aware replacement for a secret.
+
     Returns:
-        tuple of (replacement_value, reason, used_llm)
+        tuple of (replacement_value, reason, used_llm, strip_quotes)
         - replacement_value: the string to replace the secret with
         - reason: explanation from LLM (None if fallback used)
         - used_llm: True if LLM was used successfully, False if fallback
+        - strip_quotes: True if surrounding quotes should be stripped from the secret
+                        before applying the replacement (used for env_ref strategy)
     """
+    import threading
+
+    # Short-circuit: .env definition files always use empty strategy (no LLM needed).
+    # .env files contain KEY=VALUE pairs — the value IS the secret. The correct fix is
+    # to remove the value and leave KEY= as a template for developers to fill in.
+    _fp_name = Path(file_path).name.lower()
+    if _fp_name.startswith(".env") or _fp_name in ("env",):
+        return "", ".env file: remove value, leave key as template", True, False
+
     # Check if LLM is enabled
     config = _get_llm_config()
     if not config:
-        return _safe_replacement(rule_id), None, False
+        safe = _safe_replacement(rule_id, file_path)
+        return safe, None, False, False
 
     # Get file extension
     full_path = repo_root / file_path
@@ -184,7 +319,8 @@ def _intelligent_replacement(
         full_path, line_number, context=5, secret_value=secret_value, repo_root=repo_root
     )
     if not context_lines:
-        return _safe_replacement(rule_id), None, False
+        safe = _safe_replacement(rule_id, file_path)
+        return safe, None, False, False
 
     # Load and format the prompt using safe string replacement
     # (can't use .format() because context_lines may contain {VAR:-value} patterns)
@@ -198,98 +334,105 @@ def _intelligent_replacement(
     # Call Ollama with timeout
     try:
         import ollama
-        
-        model = config.get("llm_model", "qwen3-coder:30b")
+
+        model = config.get("llm_model", "qwen2.5-coder:3b")
         base_url = config.get("llm_base_url", "http://localhost:11434")
-        
-        # Create client with base URL
+        timeout = float(config.get("llm_fix_timeout", _LLM_FIX_TIMEOUT_SECONDS))
+
         client = ollama.Client(host=base_url)
-        
-        # Call with timeout (ollama client doesn't have native timeout, use subprocess fallback)
-        import threading
+
         result_container: dict = {}
         error_container: dict = {}
-        
+
         def call_llm():
             try:
                 response = client.chat(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0.1},
+                    options={"temperature": 0.1, "num_predict": 256},
                 )
                 result_container["response"] = response
             except Exception as e:
                 error_container["error"] = e
-        
-        thread = threading.Thread(target=call_llm)
+
+        thread = threading.Thread(target=call_llm, daemon=True)
         thread.start()
-        thread.join(timeout=10.0)  # 10 second timeout
-        
+        thread.join(timeout=timeout)
+
         if thread.is_alive():
-            # Timeout - fall back to safe replacement
-            return _safe_replacement(rule_id), None, False
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, "LLM timeout", False, False
+
         if "error" in error_container:
-            return _safe_replacement(rule_id), None, False
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
         if "response" not in result_container:
-            return _safe_replacement(rule_id), None, False
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
         response = result_container["response"]
         response_text = response.get("message", {}).get("content", "")
-        
-        # Parse JSON response
-        # Handle potential markdown code blocks
-        response_text = response_text.strip()
-        if response_text.startswith("```"):
-            # Remove markdown code block
-            lines = response_text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            response_text = "\n".join(lines)
-        
-        # Parse JSON
-        try:
-            result = json.loads(response_text)
-        except json.JSONDecodeError:
-            return _safe_replacement(rule_id), None, False
-        
-        # Validate response structure
+
+        # Parse JSON response (handles <think> tags, markdown fences, embedded JSON)
+        result = _extract_json_from_response(response_text)
         if not isinstance(result, dict):
-            return _safe_replacement(rule_id), None, False
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
         replacement = result.get("replacement")
         reason = result.get("reason")
         confident = result.get("confident", False)
-        
+        strip_quotes = bool(result.get("strip_quotes", False))
+        strategy = result.get("strategy", "placeholder")
+
         # Validation checks
         if replacement is None:
-            return _safe_replacement(rule_id), None, False
-        
-        # Must be a string
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
         if not isinstance(replacement, str):
-            return _safe_replacement(rule_id), None, False
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
         # Must not contain the original secret
         if secret_value in replacement:
-            return _safe_replacement(rule_id), None, False
-        
-        # Must be a single line
-        if "\n" in replacement:
-            return _safe_replacement(rule_id), None, False
-        
-        # If not confident, fall back
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
+        # Multi-line is only acceptable for "empty" strategy (replacement = "")
+        if "\n" in replacement and strategy != "empty":
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, None, False, False
+
+        # If not confident, use safe fallback but preserve the reason
         if not confident:
-            return _safe_replacement(rule_id), reason, False
-        
-        return replacement, reason, True
-        
+            safe = _safe_replacement(rule_id, file_path)
+            return safe, reason, False, False
+
+        # Post-processing: detect mismatched language syntax
+        # If the LLM returned Python env-ref syntax for a non-Python file, correct it.
+        ext_lower = extension.lower()
+        if strip_quotes and "os.environ" in replacement and ext_lower in ("yaml", "yml", "toml", "ini", "conf", "json", "xml"):
+            # YAML/config file should not get Python syntax.
+            # Extract the env var name from the replacement and convert to ${VAR} syntax.
+            import re as _re
+            env_var = result.get("env_var_name", "")
+            if not env_var:
+                m = _re.search(r"['\"]([\w_]+)['\"]", replacement)
+                env_var = m.group(1) if m else "SECRET_VALUE"
+            replacement = f"${{{env_var}}}"
+            strip_quotes = False
+            reason = "YAML config: use ${" + env_var + "} environment variable reference"
+
+        return replacement, reason, True, strip_quotes
+
     except ImportError:
-        return _safe_replacement(rule_id), None, False
+        safe = _safe_replacement(rule_id, file_path)
+        return safe, None, False, False
     except Exception:
-        return _safe_replacement(rule_id), None, False
+        safe = _safe_replacement(rule_id, file_path)
+        return safe, None, False, False
 
 
 def _is_binary_file(file_path: Path) -> bool:
@@ -330,34 +473,79 @@ def _escape_for_replacements(secret: str) -> str:
     return result
 
 
-def _safe_replacement(rule_id: str) -> str:
+def _safe_replacement(rule_id: str, file_path: str = "") -> str:
     """
     Return a replacement string that:
     - Has very low entropy (all same chars or obvious pattern)
     - Is clearly a placeholder — won't be flagged by any scanner
-    - Is contextually appropriate for the secret type
+    - Is contextually appropriate for the secret type and file context
     - Never empty (empty values still suspicious on variable lines)
     """
+    # For .env files: empty string is the correct safe replacement
+    # (key stays, value removed — safe to commit as a template)
+    if file_path:
+        p = Path(file_path)
+        name = p.name.lower()
+        if name.startswith(".env") or name in ("env",):
+            return ""
+
     rule_lower = rule_id.lower()
+
+    # AWS
+    if "aws-access" in rule_lower or ("aws" in rule_lower and "secret" not in rule_lower):
+        return "your-aws-access-key-id-here"
+    if "aws" in rule_lower and "secret" in rule_lower:
+        return "your-aws-secret-access-key-here"
     if "aws" in rule_lower:
-        return "AKIAIOSFODNN7EXAMPLE"
+        return "your-aws-credential-here"
+
+    # GitHub / GitLab
     if "github" in rule_lower or "ghp" in rule_lower:
-        return "ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        return "your-github-token-here"
     if "gitlab" in rule_lower:
-        return "glpat-xxxxxxxxxxxxxxxxxxxx"
+        return "your-gitlab-token-here"
+
+    # Slack
+    if "slack" in rule_lower and "webhook" in rule_lower:
+        return "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
     if "slack" in rule_lower:
-        return "xoxb-REDACTED"
+        return "your-slack-token-here"
+
+    # Stripe
     if "stripe" in rule_lower:
-        return "sk_test_REDACTED"
+        return "your-stripe-secret-key-here"
+
+    # Twilio
     if "twilio" in rule_lower:
-        return "SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        return "your-twilio-auth-token-here"
+
+    # SendGrid
     if "sendgrid" in rule_lower:
-        return "SG-REDACTED"
-    if "openai" in rule_lower or "sk-" in rule_lower:
-        return "sk-REDACTED"
-    if "private-key" in rule_lower or "pem" in rule_lower:
-        return "-----BEGIN PRIVATE KEY-----\nREDACTED_BY_LEAKFIX\n-----END PRIVATE KEY-----"
-    return "REDACTED"
+        return "your-sendgrid-api-key-here"
+
+    # OpenAI / generic sk- keys
+    if "openai" in rule_lower:
+        return "your-openai-api-key-here"
+    if "generic-api-key" in rule_lower or "sk-" in rule_lower:
+        return "your-api-key-here"
+
+    # Private keys / certificates
+    if "private-key" in rule_lower or "pem" in rule_lower or "rsa" in rule_lower:
+        return "-----BEGIN PRIVATE KEY-----\nYOUR_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----"
+
+    # JWT secrets
+    if "jwt" in rule_lower:
+        return "your-jwt-secret-here"
+
+    # Database passwords
+    if "database" in rule_lower or "db" in rule_lower or "postgres" in rule_lower:
+        return "your-database-password-here"
+
+    # Generic password
+    if "password" in rule_lower:
+        return "your-password-here"
+
+    return "your-secret-here"
 
 
 class Fixer:
@@ -479,32 +667,37 @@ class Fixer:
         commit_count = self._count_commits()
 
         # Pre-compute intelligent replacements for all findings
-        # Key: (secret_value, file, line) -> (replacement, reason, used_llm)
-        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] = {}
+        # Key: (secret_value, file, line) -> (replacement, reason, used_llm, strip_quotes)
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool, bool]] = {}
         fix_logs: list[str] = []
-        
+
         from rich.console import Console
         console = Console()
-        
+
         for f in findings:
             key = (f.secret_value, f.file, f.line)
             if key not in replacement_map:
                 if replace_with:
                     # User specified explicit replacement
-                    replacement_map[key] = (replace_with, None, False)
+                    replacement_map[key] = (replace_with, None, False, False)
                 else:
                     # Use intelligent replacement
-                    replacement, reason, used_llm = _intelligent_replacement(
+                    replacement, reason, used_llm, strip_quotes = _intelligent_replacement(
                         f.secret_value, f.file, f.line, f.rule_id, self.repo_root
                     )
-                    replacement_map[key] = (replacement, reason, used_llm)
-                    
+                    replacement_map[key] = (replacement, reason, used_llm, strip_quotes)
+
                     # Log which method was used
                     display_secret = _mask_secret_for_display(f.secret_value)
+                    strategy_tag = " [env-ref]" if strip_quotes else ""
                     if used_llm and reason:
-                        fix_logs.append(f"✓ Fixed intelligently: \"{display_secret}\" → \"{replacement}\" ({reason})")
+                        fix_logs.append(
+                            f"✓ LLM fix{strategy_tag}: \"{display_secret}\" → \"{replacement}\" ({reason})"
+                        )
                     else:
-                        fix_logs.append(f"✓ Fixed with placeholder: \"{display_secret}\" → \"{replacement}\"")
+                        fix_logs.append(
+                            f"✓ Placeholder: \"{display_secret}\" → \"{replacement}\""
+                        )
 
         # Print fix logs
         for log in fix_logs:
@@ -654,10 +847,15 @@ class Fixer:
                 replacement = replace_with
                 method = ""
             else:
-                replacement, reason, used_llm = _intelligent_replacement(
+                replacement, reason, used_llm, strip_quotes = _intelligent_replacement(
                     f.secret_value, f.file, f.line, f.rule_id, self.repo_root
                 )
-                method = " (intelligent)" if used_llm else " (placeholder)"
+                if used_llm and strip_quotes:
+                    method = " (LLM → env-ref)"
+                elif used_llm:
+                    method = " (LLM)"
+                else:
+                    method = " (placeholder)"
             lines.append(f"  {f.file}:{f.line} - {display_secret} → {replacement}{method}")
         if binary_files:
             lines.append("")
@@ -703,7 +901,7 @@ class Fixer:
         confirmed = []
         for f in findings:
             display_secret = _mask_secret_for_display(f.secret_value)
-            replacement = replace_with if replace_with else _safe_replacement(f.rule_id)
+            replacement = replace_with if replace_with else _safe_replacement(f.rule_id, f.file)
             if Confirm.ask(
                 f"Replace in {f.file}:{f.line} - {display_secret} → {replacement}?",
                 default=True,
@@ -711,15 +909,77 @@ class Fixer:
                 confirmed.append(f)
         return confirmed
 
+    def _update_env_example(self, env_file_path: str, findings: list[Finding]) -> None:
+        """
+        When a .env file is cleaned, create or update the corresponding .env.example
+        file. The example file keeps each variable name but with an empty value and a
+        guidance comment, so developers know exactly what to fill in.
+        """
+        import re
+
+        env_full = self.repo_root / env_file_path
+        p = Path(env_file_path)
+        # Determine the .env.example path
+        example_name = p.name + ".example" if not p.name.endswith(".example") else p.name
+        example_path = self.repo_root / p.parent / example_name
+
+        # Collect the variable names that had secrets
+        secret_vars: set[str] = {f.file for f in findings}  # placeholder — populated below
+        secret_var_names: set[str] = set()
+        for finding in findings:
+            # Try to extract the variable name from the .env line
+            try:
+                file_lines = env_full.read_text(encoding="utf-8", errors="replace").splitlines()
+                if 0 < finding.line <= len(file_lines):
+                    line = file_lines[finding.line - 1]
+                    m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+                    if m:
+                        secret_var_names.add(m.group(1))
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        if not secret_var_names:
+            return
+
+        # Read existing .env.example (if present), otherwise use the cleaned .env as base
+        try:
+            if example_path.exists():
+                example_content = example_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                example_content = env_full.read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeDecodeError):
+            return
+
+        lines = example_content.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+            if m and m.group(1) in secret_var_names:
+                var = m.group(1)
+                # Replace the line with key=  (empty value) plus a comment
+                lines[i] = f"{var}=  # TODO: set your {var.lower().replace('_', '-')} here\n"
+
+        example_path.parent.mkdir(parents=True, exist_ok=True)
+        example_path.write_text("".join(lines), encoding="utf-8")
+
+        # Stage the .env.example file
+        subprocess.run(
+            ["git", "add", str(example_path)],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            check=False,
+        )
+
     def _fix_working_files(
         self,
         findings: list[Finding],
         replace_with: str,
         confirm: bool = False,
         include_untracked: bool = False,
-        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] | None = None,
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool, bool]] | None = None,
     ) -> None:
         """Replace secrets in current working files."""
+        import re
+
         # Group by file
         by_file: dict[str, list[Finding]] = {}
         for f in findings:
@@ -729,6 +989,9 @@ class Fixer:
         tracked: set[str] = set()
         if not include_untracked:
             tracked = self.scanner.get_tracked_files()
+
+        # Track which .env files were modified so we can update .env.example
+        env_files_modified: dict[str, list[Finding]] = {}
 
         for file_path_str, file_findings in by_file.items():
             # Skip untracked files unless include_untracked is True
@@ -744,23 +1007,50 @@ class Fixer:
             except (OSError, UnicodeDecodeError):
                 continue
             lines = content.splitlines(keepends=True)
+
+            is_env_file = Path(file_path_str).name.lower().startswith(".env") or \
+                          Path(file_path_str).name.lower() == "env"
+
             # Sort by line descending so we don't mess up indices
             for f in sorted(file_findings, key=lambda x: -x.line):
                 line_idx = f.line - 1
                 if 0 <= line_idx < len(lines):
                     old_line = lines[line_idx]
-                    # Determine replacement: use pre-computed intelligent replacement if available
+                    # Determine replacement and strip_quotes flag
                     key = (f.secret_value, f.file, f.line)
                     if replacement_map and key in replacement_map:
-                        actual_replacement = replacement_map[key][0]
+                        actual_replacement, _reason, _used_llm, strip_quotes = replacement_map[key]
                     elif replace_with:
-                        actual_replacement = replace_with
+                        actual_replacement, strip_quotes = replace_with, False
                     else:
-                        actual_replacement = _safe_replacement(f.rule_id)
-                    new_line = old_line.replace(f.secret_value, actual_replacement)
+                        actual_replacement = _safe_replacement(f.rule_id, f.file)
+                        strip_quotes = False
+
+                    if strip_quotes:
+                        # Replace "secret" or 'secret' with the replacement (no surrounding quotes)
+                        # This handles env-ref replacements like: api_key = "secret"
+                        #   → api_key = os.environ.get('API_KEY')
+                        escaped_secret = re.escape(f.secret_value)
+                        new_line = re.sub(
+                            r"""(['"]?)""" + escaped_secret + r"""(['"]?)""",
+                            lambda m: actual_replacement,
+                            old_line,
+                            count=1,
+                        )
+                    else:
+                        new_line = old_line.replace(f.secret_value, actual_replacement)
+
                     if new_line != old_line:
                         lines[line_idx] = new_line
+
             full_path.write_text("".join(lines))
+
+            if is_env_file:
+                env_files_modified[file_path_str] = file_findings
+
+        # Generate / update .env.example for each modified .env file
+        for env_file, env_findings in env_files_modified.items():
+            self._update_env_example(env_file, env_findings)
 
         # Stage changed files (only tracked ones)
         for file_path_str in by_file:
@@ -779,9 +1069,15 @@ class Fixer:
         self,
         findings: list[Finding],
         replace_with: str,
-        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool]] | None = None,
+        replacement_map: dict[tuple[str, str, int], tuple[str, str | None, bool, bool]] | None = None,
     ) -> Path | None:
-        """Create replacements.txt for git-filter-repo. Format: literal:secret==>replacement"""
+        """Create replacements.txt for git-filter-repo. Format: literal:secret==>replacement
+
+        NOTE: For git history rewrites we always use the plain string replacement (never
+        strip_quotes / env-ref replacements) because git-filter-repo performs raw text
+        substitution across binary blobs — it cannot handle quote-stripping logic.
+        The env-ref upgrade is applied only to the working-directory files.
+        """
         # Dedupe by secret_value - same secret value gets one replacement
         # git-filter-repo replaces ALL occurrences of the secret value in history
         secrets_seen: set[str] = set()
@@ -796,11 +1092,18 @@ class Fixer:
                 # Determine replacement: use pre-computed intelligent replacement if available
                 key = (f.secret_value, f.file, f.line)
                 if replacement_map and key in replacement_map:
-                    actual_replacement = replacement_map[key][0]
+                    actual_replacement, _reason, _used_llm, strip_quotes = replacement_map[key]
+                    # For history rewrites, env-ref replacements (strip_quotes=True) are not
+                    # applicable — use the safe placeholder instead.
+                    if strip_quotes:
+                        actual_replacement = _safe_replacement(f.rule_id, f.file)
                 elif replace_with:
                     actual_replacement = replace_with
                 else:
-                    actual_replacement = _safe_replacement(f.rule_id)
+                    actual_replacement = _safe_replacement(f.rule_id, f.file)
+                # Ensure history replacement is never empty (would erase the key in key=value lines)
+                if not actual_replacement.strip():
+                    actual_replacement = "your-secret-here"
                 replacements.append(f"literal:{escaped}==>{actual_replacement}")
         if not replacements:
             return None
