@@ -453,7 +453,7 @@ def _format_hook_mode(findings: list[Finding], dangerous_files: list[str], path:
 @click.option(
     "--include-untracked",
     is_flag=True,
-    help="Include untracked/gitignored files in scan.",
+    help="Include untracked/gitignored files (only meaningful with --history; use --all to scan everything).",
 )
 @click.option(
     "--verbose",
@@ -476,7 +476,8 @@ def scan(
     verbose: bool,
 ):
     """Scan repository for leaked secrets."""
-    smart = not raw_flag
+    # Smart mode (classification) only applies to table output — json/html need raw findings
+    smart = not raw_flag and output == "table"
     
     if not check_gitleaks_installed():
         console.print("[red]gitleaks not found. Run: brew install gitleaks[/red]")
@@ -493,6 +494,8 @@ def scan(
     ggshield_msg = scanner.get_scanner_info_message()
     if ggshield_msg:
         console.print(f"[dim]{ggshield_msg}[/dim]")
+
+    _scan_all_history_only_count = 0  # tracks secrets only in history (not in working files)
 
     # Scan with progress bar (Apple Intelligence glow style if available)
     if _UI_AVAILABLE:
@@ -515,31 +518,50 @@ def scan(
             findings = scanner.scan_staged()
             progress.update(task, completed=True)
         elif scan_all_flag:
-            task1 = progress.add_task("Scanning working directory...", total=None)
-            working = scanner.scan_working_directory(include_untracked=include_untracked)
+            # --all: scan everything — working files (including untracked/gitignored) + history
+            task1 = progress.add_task("Scanning all files on disk...", total=None)
+            working = scanner.scan_working_directory(include_untracked=True)
             progress.update(task1, completed=True)
             task2 = progress.add_task("Scanning git history...", total=None)
             history_findings = scanner.scan_history()
             progress.update(task2, completed=True)
-            findings = scanner._dedupe_findings(working + history_findings)
+            working_keys = {(f.file, f.line) for f in working}
+            history_only_count = sum(1 for f in history_findings if (f.file, f.line) not in working_keys)
+            findings = scanner._dedupe_findings(history_findings + working)
+            _scan_all_history_only_count = history_only_count
         elif history:
             task = progress.add_task("Scanning git history...", total=None)
             findings = scanner.scan_history()
             progress.update(task, completed=True)
         else:
-            task = progress.add_task("Scanning repository...", total=None)
-            findings = scanner.scan_working_directory(include_untracked=include_untracked)
+            # Default smart scan: staged files + git history (ignores unstaged/untracked)
+            task = progress.add_task("Scanning staged files + git history...", total=None)
+            findings = scanner.scan_smart()
             progress.update(task, completed=True)
 
-    # Show warnings for skipped untracked files (compact summary or verbose)
-    if scanner._untracked_files_warned and not include_untracked:
+    # Show --all breakdown so users understand what history scanning added
+    if scan_all_flag and findings:
+        in_working = len(findings) - _scan_all_history_only_count
+        if _scan_all_history_only_count > 0:
+            console.print(
+                f"[dim]--all: {in_working} secret(s) in working files + "
+                f"{_scan_all_history_only_count} additional in history only "
+                f"(removed from working files but still in git commits)[/dim]"
+            )
+        else:
+            console.print(
+                f"[dim]--all: {len(findings)} secret(s) — all present in both working files and git history. "
+                f"Use `leakfix fix` to remove from both.[/dim]"
+            )
+
+    # Show warnings for skipped untracked files — only relevant in --all mode
+    if scan_all_flag and scanner._untracked_files_warned:
         skipped_count = len(scanner._untracked_files_warned)
         if verbose:
             for f in sorted(scanner._untracked_files_warned):
-                console.print(f"[dim]  Skipped {f} (not tracked by git)[/dim]")
+                console.print(f"[dim]  Skipped {f} (untracked)[/dim]")
         else:
-            console.print(f"[dim]{skipped_count} untracked files skipped (secrets safe — not in git)[/dim]")
-            console.print("[dim]  Run with --include-untracked to scan them too[/dim]")
+            console.print(f"[dim]{skipped_count} untracked file(s) scanned[/dim]")
 
     findings = _filter_by_severity(findings, severity)
 
@@ -578,10 +600,10 @@ def scan(
 
     if not findings:
         console.print("[green]No secrets found[/green]")
-        if has_commits(path) and not history and not scan_all_flag:
+        if not scan_all_flag and not history:
             console.print(
-                "[dim]No secrets in working directory. Run `leakfix scan --history` "
-                "to check git history.[/dim]"
+                "[dim]Scanned staged files + git history. Run `leakfix scan --all` "
+                "to also scan unstaged and untracked files.[/dim]"
             )
         sys.exit(0)
     config = load_config()
@@ -626,15 +648,10 @@ def scan(
 
     if not findings:
         console.print("[green]No secrets found[/green]")
-        if not has_commits(path):
+        if not scan_all_flag and not history:
             console.print(
-                "[dim]Tip: Repo has no commits. Stage files with 'git add' and use "
-                "'leakfix scan --staged' or 'leakfix scan --all' to scan.[/dim]"
-            )
-        elif not history and not scan_all_flag:
-            console.print(
-                "[dim]No secrets in working directory. Run `leakfix scan --history` "
-                "to check git history.[/dim]"
+                "[dim]Scanned staged files + git history. Run `leakfix scan --all` "
+                "to also scan unstaged and untracked files.[/dim]"
             )
         sys.exit(0)
 

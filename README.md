@@ -72,16 +72,19 @@ leakfix automatically installs its dependencies, but you'll need:
 ## Quick Start
 
 ```bash
-# 1. Scan your repo for secrets
+# 1. Smart scan — staged files + git history (ignores unstaged/gitignored)
 leakfix scan
 
-# 2. Preview what would be fixed (dry run)
+# 1b. Full scan — everything including unstaged and untracked files
+leakfix scan --all
+
+# 2. Preview what would be fixed (dry run, LLM-generated replacements shown)
 leakfix fix --dry-run
 
-# 3. Fix everything — rewrites files AND git history
-leakfix fix --all --no-push
+# 3. Fix confirmed secrets only (smart mode) — rewrites files AND git history
+leakfix fix --no-push
 
-# 4. Force-push cleaned history to remote
+# 4. Fix everything including false positives, then force-push
 leakfix fix --all
 ```
 
@@ -135,8 +138,9 @@ Or create `~/.leakfix/config.json` manually:
 ## All Commands
 
 ```bash
-leakfix scan                    # Scan working directory and git history
-leakfix scan --history          # Scan git history only
+leakfix scan                    # Scan working directory (current files)
+leakfix scan --history          # Scan git history only (past commits)
+leakfix scan --all              # Scan both working directory and git history
 leakfix scan --llm              # Use LLM to filter false positives
 
 leakfix fix                     # Fix confirmed secrets only
@@ -149,8 +153,8 @@ leakfix fix --history-only      # Rewrite history only, skip working files
 leakfix install-hook            # Install pre-commit hook to block future leaks
 leakfix uninstall-hook          # Remove pre-commit hook
 leakfix setup                   # Interactive setup wizard
-leakfix ignore <pattern>        # Add pattern to .leakfixignore
-leakfix watch                   # Watch for new secrets in real-time
+leakfix gitignore               # Audit and fix .gitignore for secret-related patterns
+leakfix guard                   # Watch for dangerous files in real-time
 ```
 
 ---
@@ -281,7 +285,7 @@ Block secrets from ever reaching git history:
 leakfix install-hook
 ```
 
-This installs a pre-commit hook that runs `leakfix scan --staged` before every `git commit`. If secrets are found, the commit is rejected with a helpful error message.
+This installs a pre-commit hook that runs `leakfix scan --staged --hook-mode` before every `git commit`. If secrets are found, the commit is rejected with a helpful error message.
 
 ---
 
@@ -301,6 +305,12 @@ A: Yes. Any Ollama-compatible model works. Recommended: `qwen2.5-coder:3b` (1.9G
 
 **Q: What is the difference between `leakfix scan` and `leakfix fix`?**
 A: `scan` only reports secrets. `fix` reports AND applies replacements in working files + git history.
+
+**Q: What is the difference between `leakfix scan` and `leakfix scan --all`?**
+A: `leakfix scan` (smart mode) scans staged files and git history only — the files that are already in or about to enter version control. It ignores unstaged changes and untracked/gitignored files. `leakfix scan --all` scans everything: all files on disk (including untracked and gitignored) plus full git history.
+
+**Q: What is the difference between `leakfix fix` and `leakfix fix --all`?**
+A: `leakfix fix` (smart mode) only fixes secrets the classifier identifies as real (CONFIRMED). False positives — test fixtures, example values, template strings — are left alone. `leakfix fix --all` fixes everything the scanner finds, including probable false positives. Both modes use the LLM to generate context-aware replacements (env var references, template values) rather than simple redaction.
 
 **Q: How does leakfix compare to running `git filter-branch` manually?**
 A: `git filter-branch` only replaces exact strings you specify. leakfix finds all secrets automatically, generates smart replacements using an LLM, and handles the entire workflow including re-adding remotes.

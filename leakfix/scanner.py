@@ -178,6 +178,17 @@ class Scanner:
         findings = self._scan_with_both_scanners(gitleaks_scan, ggshield_history=True)
         return self._filter_ignored(findings)
 
+    def scan_smart(self) -> list[Finding]:
+        """Smart scan (default mode): staged files + git history only.
+
+        Ignores unstaged changes and untracked/gitignored files — those haven't
+        reached version control and pose no leak risk there. Prefer history
+        findings in dedup so commit hashes are preserved.
+        """
+        staged = self.scan_staged()
+        history = self.scan_history()
+        return self._dedupe_findings(history + staged)
+
     def scan_all(self, include_untracked: bool = False) -> list[Finding]:
         """Scan both working directory and git history."""
         findings = self.scan_working_directory(include_untracked=include_untracked) + self.scan_history()

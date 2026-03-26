@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/princebharti/Documents/leakfix_cli/leakfix -path */.github/* -o -path */workflows/*)"
+    ]
+  }
+}
