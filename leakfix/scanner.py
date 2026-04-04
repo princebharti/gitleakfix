@@ -32,6 +32,7 @@ class Finding:
     entropy: float
     severity: str
     scanner: str = "gitleaks"  # "gitleaks", "ggshield", or "both"
+    match_context: str = ""    # surrounding code line (e.g. GITLAB_TOKEN=glpat-...)
 
 
 def _derive_severity(rule_id: str, entropy: float) -> str:
@@ -285,6 +286,7 @@ class Scanner:
                     rule_id=rule_id,
                     entropy=entropy,
                     severity=_derive_severity(rule_id, entropy),
+                    match_context=item.get("Match", "").strip(),
                 )
             )
         return findings

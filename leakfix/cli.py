@@ -118,38 +118,44 @@ def _severity_dot(severity: str) -> str:
     return f"[dim #6E6E73]○[/dim #6E6E73]"
 
 
+def _commit_or_staged(f: Finding) -> str:
+    """Return short commit hash, or 'staged' badge if no commit (i.e. from staged changes)."""
+    if not f.commit:
+        return "[bold #FFBA71]staged[/bold #FFBA71]"
+    return f.commit[:7]
+
+
 def _format_table(findings: list[Finding], title: str = "Scan Results") -> None:
     """Print findings as an Apple Intelligence styled table."""
     table = Table(
         title=f"[bold #BC82F3]leakfix[/bold #BC82F3]  [dim #6E6E73]{title}[/dim #6E6E73]",
-        header_style=f"bold #8D9FFF",
+        header_style="bold #8D9FFF",
         border_style="#3A3A3C",
         box=rich_box.SIMPLE_HEAD,
         row_styles=["", "dim"],
         show_lines=False,
         padding=(0, 1),
     )
-    table.add_column("File", style="#8D9FFF", no_wrap=False)
+    table.add_column("File / Path", style="#8D9FFF", no_wrap=True, max_width=36)
     table.add_column("Line", justify="right", style="dim", width=5)
-    table.add_column("Secret Type", style="#F5B9EA")
-    table.add_column("Value", style="dim")
+    table.add_column("Secret Type", style="#F5B9EA", no_wrap=True, max_width=22)
+    table.add_column("Match", style="dim", no_wrap=True, max_width=38)
     table.add_column("Sev", justify="center", width=3)
-    table.add_column("Scanner", justify="center")
-    table.add_column("Commit", style="dim", width=7)
-    table.add_column("Author", style="dim")
+    table.add_column("Source", justify="center", no_wrap=True)
     for f in findings:
-        commit_short = f.commit[:7] if len(f.commit) >= 7 else (f.commit or "—")
-        scanner_badge = _format_scanner_badge(getattr(f, "scanner", "gitleaks"))
-        masked = _mask_secret(f.secret_value)
+        match_display = (getattr(f, "match_context", "") or _mask_secret(f.secret_value)).replace("\n", " ").replace("\r", "")
+        if len(match_display) > 36:
+            match_display = match_display[:33] + "…"
+        file_display = f.file
+        if len(file_display) > 34:
+            file_display = "…" + file_display[-33:]
         table.add_row(
-            f.file,
+            file_display,
             str(f.line) if f.line else "—",
             f.rule_id,
-            masked,
+            match_display,
             _severity_dot(f.severity),
-            scanner_badge,
-            commit_short,
-            f.author or "—",
+            _commit_or_staged(f),
         )
     console.print()
     console.print(table)
@@ -218,10 +224,14 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
 
     def _loc(finding: Finding) -> str:
         """Format file:line location clearly."""
-        loc = finding.file
-        if finding.line:
-            loc = f"{finding.file}:{finding.line}"
-        return loc
+        line_part = f":{finding.line}" if finding.line else ""
+        return f"{finding.file}{line_part}"
+
+    def _source_badge(finding: Finding) -> str:
+        """Show 'staged' or short commit hash as source badge."""
+        if not finding.commit:
+            return "[bold #FFBA71]staged[/bold #FFBA71]"
+        return f"[dim #6E6E73]{finding.commit[:7]}[/dim #6E6E73]"
 
     if confirmed:
         console.print(f"\n  [bold #FF6778]● CONFIRMED SECRETS[/bold #FF6778]  [dim #6E6E73]{len(confirmed)} found[/dim #6E6E73]")
@@ -232,11 +242,18 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
             sev = c.finding.severity.upper()
             stag = scanner_tag(c.finding)
             sev_color = "#FF6778" if sev == "HIGH" else ("#FFBA71" if sev == "MEDIUM" else "#6E6E73")
+            match_ctx = getattr(c.finding, "match_context", "")
             console.print(
                 f"  [bold #FF6778]●[/bold #FF6778]  {stag}"
                 f"[bold #8D9FFF]{_loc(c.finding)}[/bold #8D9FFF]  "
-                f"[dim #F5B9EA]{c.finding.rule_id}[/dim #F5B9EA]"
+                f"[dim #F5B9EA]{c.finding.rule_id}[/dim #F5B9EA]  "
+                f"{_source_badge(c.finding)}"
             )
+            if match_ctx:
+                display_match = match_ctx.replace("\n", " ").replace("\r", "")
+                if len(display_match) > 60:
+                    display_match = display_match[:57] + "…"
+                console.print(f"     [dim]match[/dim] [dim #8D9FFF]{display_match}[/dim #8D9FFF]")
             console.print(
                 f"     [dim]value[/dim] [bold]{masked}[/bold]  "
                 f"[dim]entropy {entropy:.2f}  [bold {sev_color}]{sev}[/bold {sev_color}][/dim]"
@@ -255,7 +272,8 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
             console.print(
                 f"  [dim #6E6E73]○[/dim #6E6E73]  {stag}"
                 f"[dim #8D9FFF]{_loc(c.finding)}[/dim #8D9FFF]  "
-                f"[dim]{c.finding.rule_id}[/dim]"
+                f"[dim]{c.finding.rule_id}[/dim]  "
+                f"{_source_badge(c.finding)}"
             )
             console.print(f"     [dim #6E6E73]↳ {c.reason}[/dim #6E6E73]")
         console.print()
@@ -265,11 +283,18 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
         console.print(f"  [dim #3A3A3C]{'─' * 54}[/dim #3A3A3C]")
         for c in review_needed:
             stag = scanner_tag(c.finding)
+            match_ctx = getattr(c.finding, "match_context", "")
             console.print(
                 f"  [bold #FFBA71]◉[/bold #FFBA71]  {stag}"
                 f"[#8D9FFF]{_loc(c.finding)}[/#8D9FFF]  "
-                f"[dim]{c.finding.rule_id}[/dim]"
+                f"[dim]{c.finding.rule_id}[/dim]  "
+                f"{_source_badge(c.finding)}"
             )
+            if match_ctx:
+                display_match = match_ctx.replace("\n", " ").replace("\r", "")
+                if len(display_match) > 60:
+                    display_match = display_match[:57] + "…"
+                console.print(f"     [dim]match[/dim] [dim #8D9FFF]{display_match}[/dim #8D9FFF]")
             console.print(f"     [dim #FFBA71]↳ {c.reason}[/dim #FFBA71]")
         console.print()
 
