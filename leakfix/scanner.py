@@ -198,10 +198,10 @@ class Scanner:
         """Return path to gitleaks config."""
         repo_config = self.repo_root / ".gitleaks.toml"
         if repo_config.exists():
-            return None
+            return repo_config
         repo_config_yml = self.repo_root / ".gitleaks.yml"
         if repo_config_yml.exists():
-            return None
+            return repo_config_yml
         bundled = Path(__file__).parent / "gitleaks-extended.toml"
         if bundled.exists():
             return bundled
@@ -297,10 +297,10 @@ class Scanner:
         return [f for f in findings if not _is_ignored(f.file, patterns, self.repo_root)]
 
     def _dedupe_findings(self, findings: list[Finding]) -> list[Finding]:
-        """Remove duplicate findings by (file, line) only. Keep highest entropy when collision."""
-        by_key: dict[tuple[str, int], Finding] = {}
+        """Remove duplicate findings by (file, line, secret_value). Keep highest entropy when collision."""
+        by_key: dict[tuple[str, int, str], Finding] = {}
         for f in findings:
-            key = (f.file, f.line)
+            key = (f.file, f.line, f.secret_value)
             if key not in by_key or f.entropy > by_key[key].entropy:
                 by_key[key] = f
         return list(by_key.values())

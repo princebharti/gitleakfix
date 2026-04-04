@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leakfix"
-version = "1.8.0"
+version = "1.9.0"
 description = "One-stop CLI tool to detect, remove and prevent secrets in git repositories"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.0.0",
-    "ollama>=0.1.0",
+    "ollama>=0.4.0,<1.0.0",
     "watchdog>=3.0.0",
     "Jinja2>=3.0.0",
     # playwright is installed lazily on first PDF generation
@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 effects = ["terminaltexteffects>=0.11"]
+pdf = ["playwright>=1.40.0"]
 
 [project.scripts]
 leakfix = "leakfix.cli:main"

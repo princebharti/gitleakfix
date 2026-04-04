@@ -4,6 +4,30 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# Dangerous file patterns — single source of truth (used by hooks.py and watcher.py)
+DANGEROUS_PATTERNS = [
+    ".env*",
+    "*.bak",
+    "*secret*",
+    "*credential*",
+    "*token*",
+    "firebase*.json",
+    "*adminsdk*",
+    "*.pem",
+    "*.p12",
+    "*.key",
+    "*password*",
+    "*.pfx",
+    "*.cert",
+]
+
+
+def mask_secret(secret: str, max_visible: int = 4) -> str:
+    """Mask a secret for display: show first N chars then ****. Never show full value."""
+    if len(secret) <= max_visible:
+        return "****"
+    return secret[:max_visible] + "****"
+
 
 def check_gitleaks_installed() -> bool:
     """Check if gitleaks is installed and available in PATH."""

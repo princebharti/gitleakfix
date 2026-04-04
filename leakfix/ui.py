@@ -52,9 +52,19 @@ BORDER_GRADIENT = [APPLE_PURPLE, APPLE_BLUE_PURPLE, APPLE_PINK, APPLE_VIOLET, AP
 SHIMMER_WAVE = [APPLE_PURPLE, APPLE_VIOLET, APPLE_BLUE_PURPLE, APPLE_PINK, APPLE_PURPLE]
 
 
+def _gradient_rule(width: int = 56) -> None:
+    """Print a left-aligned gradient rule line."""
+    colors = [APPLE_PURPLE, APPLE_BLUE_PURPLE, APPLE_PINK, APPLE_VIOLET, APPLE_BRIGHT_PURPLE]
+    sep = Text()
+    chunk = width // len(colors)
+    for c in colors:
+        sep.append("─" * chunk, style=c)
+    console.print(sep)
+
+
 def print_banner(subtitle: str = "intelligent secret detection") -> None:
     """
-    Print the leakfix banner.
+    Print the leakfix banner (left-aligned).
     Tries terminaltexteffects beams animation first.
     Falls back to rich-gradient static version.
     Falls back to plain Rich if neither available.
@@ -112,41 +122,27 @@ def _print_tte_banner(text: str) -> None:
 
 
 def _print_gradient_banner(subtitle: str) -> None:
-    """Rich-gradient glowing panel banner."""
+    """Rich-gradient left-aligned banner."""
     from rich_gradient import Gradient
-    from rich.console import Group
 
     title = Gradient(
         "◆  leakfix  ◆",
         colors=[APPLE_PURPLE, APPLE_BLUE_PURPLE, APPLE_PINK, APPLE_VIOLET],
-        justify="center",
+        justify="left",
         expand=False,
         animated=True,
     )
     sub = Gradient(
         subtitle,
         colors=[APPLE_BLUE_PURPLE, APPLE_PURPLE],
-        justify="center",
+        justify="left",
         expand=False,
-    )
-    tagline = Gradient(
-        "✦  runs 100% locally  ·  no data leaves your machine  ✦",
-        colors=[APPLE_VIOLET, APPLE_PINK],
-        justify="center",
-        expand=False,
-    )
-
-    panel = Panel(
-        Align.center(
-            Group(Text("\n"), title, Text("\n"), sub, Text("\n"), tagline, Text("\n"))
-        ),
-        border_style=APPLE_PURPLE,
-        box=rich_box.ROUNDED,
-        padding=(0, 4),
     )
 
     console.print()
-    console.print(Align.center(panel))
+    console.print(title)
+    console.print(sub)
+    _gradient_rule()
     console.print()
 
 
@@ -163,7 +159,7 @@ def _print_shimmer_banner(subtitle: str, duration: float = 1.5) -> None:
         title = _make_gradient_text(banner_str, rot, bold=True)
         sub   = _make_gradient_text(subtitle, [rot[1], rot[2]], bold=False)
         sep = Text()
-        chunk = 53 // len(rot)
+        chunk = 56 // len(rot)
         for c in rot:
             sep.append("─" * chunk, style=c)
         return Group(Text(""), title, sub, sep, Text(""))
@@ -178,24 +174,19 @@ def _print_shimmer_banner(subtitle: str, duration: float = 1.5) -> None:
         _print_plain_banner(subtitle)
 
 def _print_plain_banner(subtitle: str) -> None:
-    """Plain Rich fallback banner."""
-    dots = Text()
-    dots.append("  ◆ ", style=f"bold {APPLE_PURPLE}")
-    dots.append("◆ ", style=f"bold {APPLE_BLUE_PURPLE}")
-    dots.append("◆ ", style=f"bold {APPLE_PINK}")
-    dots.append("◆  ", style=f"bold {APPLE_VIOLET}")
-    dots.append("leakfix", style="bold white")
-    dots.append(f"  {subtitle}", style=f"dim {APPLE_DIM}")
+    """Plain Rich fallback banner (left-aligned)."""
+    title = Text()
+    title.append("◆  ", style=f"bold {APPLE_PURPLE}")
+    title.append("leakfix", style="bold white")
+    title.append("  ◆", style=f"bold {APPLE_VIOLET}")
 
-    sep = Text()
-    colors = [APPLE_PURPLE, APPLE_BLUE_PURPLE, APPLE_PINK, APPLE_VIOLET, APPLE_BRIGHT_PURPLE]
-    chunk = 53 // len(colors)
-    for color in colors:
-        sep.append("─" * chunk, style=color)
+    sub = Text()
+    sub.append(subtitle, style=f"dim {APPLE_DIM}")
 
     console.print()
-    console.print(dots)
-    console.print(sep)
+    console.print(title)
+    console.print(sub)
+    _gradient_rule()
     console.print()
 
 
@@ -277,18 +268,17 @@ class ShimmerLive:
         """Generate the animated panel for current frame."""
         from rich.console import Group
         from rich import box as _box
-        
-        lines = [Text("\n"), self._make_title()]
+
+        lines = [Text(""), self._make_title()]
         if self.subtitle:
-            lines.append(Text("\n"))
-            lines.append(Text(self.subtitle, style=f"dim {APPLE_DIM}", justify="center"))
-        lines.append(Text("\n"))
-        
+            lines.append(Text(self.subtitle, style=f"dim {APPLE_DIM}"))
+        lines.append(Text(""))
+
         return Panel(
-            Align.center(Group(*lines)),
+            Group(*lines),
             border_style=self._border_color(),
             box=_box.HEAVY,
-            padding=(0, 4),
+            padding=(0, 2),
             width=64,
         )
     
@@ -390,21 +380,24 @@ def glow_progress_kwargs() -> dict:
         SpinnerColumn,
         TextColumn,
         BarColumn,
-        TaskProgressColumn,
         TimeElapsedColumn,
     )
 
     return {
         "columns": [
-            SpinnerColumn(spinner_name="dots", style=f"bold {APPLE_PURPLE}"),
-            TextColumn(f"[bold {APPLE_BLUE_PURPLE}]{{task.description}}[/bold {APPLE_BLUE_PURPLE}]"),
-            BarColumn(
-                bar_width=40,
-                style=APPLE_PURPLE,
-                complete_style=APPLE_BLUE_PURPLE,
-                finished_style=APPLE_PINK,
+            SpinnerColumn(
+                spinner_name="dots",
+                style=f"bold {APPLE_PURPLE}",
+                finished_text=f"[{APPLE_SUCCESS}]✓[/{APPLE_SUCCESS}]",
             ),
-            TaskProgressColumn(style=f"bold {APPLE_PINK}"),
+            TextColumn(f"[{APPLE_BLUE_PURPLE}]{{task.description}}[/{APPLE_BLUE_PURPLE}]"),
+            BarColumn(
+                bar_width=36,
+                style=f"dim {APPLE_VIOLET}",
+                complete_style=APPLE_PURPLE,
+                finished_style=APPLE_BLUE_PURPLE,
+                pulse_style=APPLE_BRIGHT_PURPLE,
+            ),
             TimeElapsedColumn(),
         ],
         "transient": True,

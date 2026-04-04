@@ -7,7 +7,6 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
@@ -64,7 +63,8 @@ class OrgScanner:
         exclude_set = set((exclude or []))
         repo_urls = self._list_gitlab_repos(url, token, group)
         repo_urls = [(u, n) for u, n in repo_urls if n not in exclude_set]
-        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history)
+        auth_header = f"Authorization: Bearer {token}" if token else None
+        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history, auth_header=auth_header)
 
     def scan_github(
         self,
@@ -78,7 +78,8 @@ class OrgScanner:
         exclude_set = set((exclude or []))
         repo_urls = self._list_github_repos(token, org)
         repo_urls = [(u, n) for u, n in repo_urls if n not in exclude_set]
-        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history)
+        auth_header = f"Authorization: Bearer {token}" if token else None
+        return self._scan_cloned_repos(repo_urls, smart=smart, scan_history=scan_history, auth_header=auth_header)
 
     def _find_git_repos(self, path: Path) -> list[Path]:
         """Recursively find all git repos under a directory."""
@@ -190,10 +191,6 @@ class OrgScanner:
                 )
                 if not http_url.endswith(".git"):
                     http_url += ".git"
-                # Add token for private repos
-                if token and "https://" in http_url:
-                    parsed = urlparse(http_url)
-                    http_url = f"{parsed.scheme}://oauth2:{token}@{parsed.netloc}{parsed.path}"
                 name = proj.get("path") or proj.get("name", "")
                 repos.append((http_url, name))
             if len(data) < 100:
@@ -222,17 +219,9 @@ class OrgScanner:
             if not data:
                 break
             for repo in data:
-                clone_url = repo.get("clone_url") or repo.get("html_url", "").replace(
-                    "github.com/", "github.com/"
-                )
+                clone_url = repo.get("clone_url") or repo.get("html_url", "")
                 if not clone_url.endswith(".git"):
                     clone_url += ".git"
-                if token:
-                    clone_url = clone_url.replace(
-                        "https://",
-                        f"https://{token}@",
-                        1,
-                    )
                 name = repo.get("name", "")
                 repos.append((clone_url, name))
             if len(data) < 100:
@@ -240,11 +229,15 @@ class OrgScanner:
             page += 1
         return repos
 
-    def _clone_repo(self, url: str, temp_dir: Path) -> Path | None:
+    def _clone_repo(self, url: str, temp_dir: Path, auth_header: str | None = None) -> Path | None:
         """Clone a repo into temp_dir. Returns path to cloned repo or None."""
         try:
+            cmd = ["git", "clone", "--depth", "1"]
+            if auth_header:
+                cmd += ["-c", f"http.extraheader={auth_header}"]
+            cmd += [url, str(temp_dir)]
             result = subprocess.run(
-                ["git", "clone", "--depth", "1", url, str(temp_dir)],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -260,6 +253,7 @@ class OrgScanner:
         repo_urls: list[tuple[str, str]],
         smart: bool = False,
         scan_history: bool = False,
+        auth_header: str | None = None,
     ) -> list[RepoResult]:
         """Clone each repo, scan it, then clean up."""
         results: list[RepoResult] = []
@@ -268,12 +262,12 @@ class OrgScanner:
             return results
 
         console.print(f"[dim]Scanning {total} repositories...[/dim]\n")
-        
+
         for url, name in repo_urls:
             with tempfile.TemporaryDirectory(prefix="leakfix-org-") as tmp:
                 clone_path = Path(tmp) / name
                 clone_path.mkdir(parents=True, exist_ok=True)
-                cloned = self._clone_repo(url, clone_path)
+                cloned = self._clone_repo(url, clone_path, auth_header=auth_header)
                 if cloned:
                     result = self._scan_repo(cloned, smart=smart, scan_history=scan_history)
                     result.repo_name = name

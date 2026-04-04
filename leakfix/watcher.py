@@ -9,24 +9,7 @@ import signal
 import sys
 from pathlib import Path
 
-from leakfix.utils import get_repo_root, is_git_repo
-
-# Dangerous file patterns to watch
-DANGEROUS_PATTERNS = [
-    ".env*",
-    "*.bak",
-    "*secret*",
-    "*credential*",
-    "*token*",
-    "firebase*.json",
-    "*adminsdk*",
-    "*.pem",
-    "*.p12",
-    "*.key",
-    "*password*",
-    "*.pfx",
-    "*.cert",
-]
+from leakfix.utils import DANGEROUS_PATTERNS, get_repo_root, is_git_repo
 
 LEAKFIX_HOME = Path.home() / ".leakfix"
 GUARD_PID_FILE = LEAKFIX_HOME / "guard.pid"
@@ -103,25 +86,41 @@ class Watcher:
                 self._observer.join()
 
     def _daemon_start(self) -> None:
-        """Run as background daemon."""
+        """Run as background daemon (double-fork pattern)."""
+        import time
         LEAKFIX_HOME.mkdir(parents=True, exist_ok=True)
+        # First fork: parent waits for intermediate child to exit
         pid = os.fork()
+        if pid < 0:
+            raise OSError("First fork failed")
         if pid > 0:
-            # Parent: write PID and exit
-            GUARD_PID_FILE.write_text(str(pid))
-            self._log_warning(f"Guard started in daemon mode (PID {pid})")
+            os.waitpid(pid, 0)
             return
-        # Child: detach and run observer
+        # Intermediate child: create new session, then fork again
         os.setsid()
+        pid2 = os.fork()
+        if pid2 < 0:
+            sys.exit(1)
+        if pid2 > 0:
+            # Intermediate child writes grandchild PID and exits
+            GUARD_PID_FILE.write_text(str(pid2))
+            self._log_warning(f"Guard started in daemon mode (PID {pid2})")
+            sys.exit(0)
+        # Grandchild: the true daemon process
+        os.umask(0o022)
         os.chdir("/")
-        sys.stdin.close()
-        sys.stdout.close()
-        sys.stderr.close()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, sys.stdin.fileno())
+        os.dup2(devnull, sys.stdout.fileno())
+        os.dup2(devnull, sys.stderr.fileno())
+        os.close(devnull)
         self._observer.start()
         while True:
             try:
-                import time
                 time.sleep(60)
+            except (SystemExit, KeyboardInterrupt):
+                self._observer.stop()
+                break
             except Exception:
                 pass
 
@@ -154,8 +153,7 @@ class Watcher:
     def _on_file_created(self, event) -> None:
         """Handle file creation."""
         path = getattr(event, "src_path", str(event))
-        filename = Path(path).name
-        if self._is_dangerous_file(filename) or self._is_dangerous_file(path):
+        if self._is_dangerous_file(path):
             if not self._check_gitignore(path):
                 self._warn_user(f"Dangerous file created (not in .gitignore): {path}")
                 self._log_warning(f"Dangerous file created: {path}")
@@ -163,8 +161,7 @@ class Watcher:
     def _on_file_modified(self, event) -> None:
         """Handle file modification."""
         path = getattr(event, "src_path", str(event))
-        filename = Path(path).name
-        if self._is_dangerous_file(filename) or self._is_dangerous_file(path):
+        if self._is_dangerous_file(path):
             if not self._check_gitignore(path):
                 self._warn_user(f"Dangerous file modified (not in .gitignore): {path}")
                 self._log_warning(f"Dangerous file modified: {path}")

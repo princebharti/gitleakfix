@@ -1104,6 +1104,8 @@ class Fixer:
                 # Ensure history replacement is never empty (would erase the key in key=value lines)
                 if not actual_replacement.strip():
                     actual_replacement = "your-secret-here"
+                # Escape characters that would corrupt the replacements file (one rule per line)
+                actual_replacement = actual_replacement.replace("\r", "").replace("\n", " ").replace("\x00", "")
                 replacements.append(f"literal:{escaped}==>{actual_replacement}")
         if not replacements:
             return None

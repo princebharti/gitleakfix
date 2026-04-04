@@ -328,11 +328,10 @@ class Reporter:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            import subprocess, sys
-            print("Installing playwright for PDF generation...")
-            subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "--break-system-packages", "-q"], check=True)
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-            from playwright.sync_api import sync_playwright
+            raise ImportError(
+                "playwright is required for PDF generation. "
+                "Install it with: pip install 'leakfix[pdf]' && playwright install chromium"
+            )
 
         # Generate HTML first to temp file, then convert to PDF
         import tempfile

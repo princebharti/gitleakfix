@@ -6,29 +6,7 @@ import fnmatch
 import subprocess
 from pathlib import Path
 
-from leakfix.utils import get_repo_root, is_git_repo
-
-# Dangerous file patterns that should typically be in .gitignore
-DANGEROUS_PATTERNS = [
-    ".env*",
-    "*.bak",
-    "*secret*",
-    "*credential*",
-    "*token*",
-    "firebase*.json",
-    "*adminsdk*",
-    "*.pem",
-    "*.p12",
-    "*.key",
-    "*password*",
-]
-
-
-def _mask_secret(secret: str) -> str:
-    """Mask secret: show first 4 chars + ***. NEVER show full value."""
-    if len(secret) <= 4:
-        return "****"
-    return secret[:4] + "****"
+from leakfix.utils import DANGEROUS_PATTERNS, get_repo_root, is_git_repo, mask_secret
 
 
 class HookManager:

@@ -6,15 +6,16 @@ import sys
 from pathlib import Path
 
 import click
+from rich import box as rich_box
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 
 from leakfix import __version__
 from leakfix.classifier import Classification, Classifier, ClassifiedFinding
 from leakfix.fixer import Fixer
 from leakfix.gitignore import GitignoreManager
-from leakfix.hooks import HookManager, _mask_secret
+from leakfix.hooks import HookManager
 from leakfix.org_scanner import OrgScanner, RepoResult
 from leakfix.reporter import Reporter
 from leakfix.scanner import Finding, Scanner
@@ -29,6 +30,7 @@ from leakfix.utils import (
     get_repo_root,
     has_commits,
     is_git_repo,
+    mask_secret as _mask_secret,
 )
 
 console = Console()
@@ -106,36 +108,53 @@ def _format_scanner_badge(scanner: str) -> str:
         return "[dim]gitleaks[/dim]"
 
 
-def _format_table(findings: list[Finding]) -> None:
-    """Print findings as a rich table."""
+def _severity_dot(severity: str) -> str:
+    """Return a colored severity dot indicator."""
+    s = severity.lower()
+    if s == "high":
+        return f"[bold #FF6778]●[/bold #FF6778]"
+    elif s == "medium":
+        return f"[bold #FFBA71]◉[/bold #FFBA71]"
+    return f"[dim #6E6E73]○[/dim #6E6E73]"
+
+
+def _format_table(findings: list[Finding], title: str = "Scan Results") -> None:
+    """Print findings as an Apple Intelligence styled table."""
     table = Table(
-        title="leakfix Scan Results",
-        show_header=True,
-        header_style="bold",
-        border_style="dim",
+        title=f"[bold #BC82F3]leakfix[/bold #BC82F3]  [dim #6E6E73]{title}[/dim #6E6E73]",
+        header_style=f"bold #8D9FFF",
+        border_style="#3A3A3C",
+        box=rich_box.SIMPLE_HEAD,
+        row_styles=["", "dim"],
+        show_lines=False,
+        padding=(0, 1),
     )
-    table.add_column("File", style="#8D9FFF")
-    table.add_column("Secret Type", style="yellow")
-    table.add_column("Line", justify="right")
-    table.add_column("Severity", style="red")
+    table.add_column("File", style="#8D9FFF", no_wrap=False)
+    table.add_column("Line", justify="right", style="dim", width=5)
+    table.add_column("Secret Type", style="#F5B9EA")
+    table.add_column("Value", style="dim")
+    table.add_column("Sev", justify="center", width=3)
     table.add_column("Scanner", justify="center")
-    table.add_column("Commit", style="dim")
+    table.add_column("Commit", style="dim", width=7)
     table.add_column("Author", style="dim")
     for f in findings:
-        commit_short = f.commit[:7] if len(f.commit) >= 7 else f.commit
-        scanner_badge = _format_scanner_badge(getattr(f, 'scanner', 'gitleaks'))
+        commit_short = f.commit[:7] if len(f.commit) >= 7 else (f.commit or "—")
+        scanner_badge = _format_scanner_badge(getattr(f, "scanner", "gitleaks"))
+        masked = _mask_secret(f.secret_value)
         table.add_row(
             f.file,
+            str(f.line) if f.line else "—",
             f.rule_id,
-            str(f.line),
-            f.severity.upper(),
+            masked,
+            _severity_dot(f.severity),
             scanner_badge,
             commit_short,
-            f.author or "-",
+            f.author or "—",
         )
+    console.print()
     console.print(table)
     file_count = len({f.file for f in findings})
-    console.print(f"\nFound {len(findings)} secret(s) in {file_count} file(s)")
+    console.print(f"  [dim #6E6E73]{len(findings)} secret(s) across {file_count} file(s)[/dim #6E6E73]")
 
 
 def _format_json(findings: list[Finding]) -> None:
@@ -177,11 +196,12 @@ AI_BANNER = """
 """
 
 def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> None:
-    """Output format for --smart scan: grouped by classification with text badges."""
+    """Output format for --smart scan: grouped by classification with Apple Intelligence theme."""
     if _UI_AVAILABLE:
         _print_banner()
     else:
         console.print(AI_BANNER)
+
     confirmed = [c for c in classified if c.classification == Classification.CONFIRMED]
     false_positives = [
         c for c in classified if c.classification == Classification.LIKELY_FALSE_POSITIVE
@@ -189,56 +209,83 @@ def _format_smart_scan(classified: list[ClassifiedFinding], repo_root: Path) -> 
     review_needed = [c for c in classified if c.classification == Classification.REVIEW_NEEDED]
 
     def scanner_tag(finding: Finding) -> str:
-        """Get scanner tag for display."""
-        scanner = getattr(finding, 'scanner', 'gitleaks')
+        scanner = getattr(finding, "scanner", "gitleaks")
         if scanner == "both":
-            return "[bold green][both][/bold green] "
+            return "[bold #30D158][both][/bold #30D158] "
         elif scanner == "ggshield":
-            return "[cyan][gg][/cyan] "
+            return "[#8D9FFF][gg][/#8D9FFF] "
         return ""
 
+    def _loc(finding: Finding) -> str:
+        """Format file:line location clearly."""
+        loc = finding.file
+        if finding.line:
+            loc = f"{finding.file}:{finding.line}"
+        return loc
+
     if confirmed:
-        console.print(f"\n[bold red]  CONFIRMED SECRETS[/bold red] [dim]({len(confirmed)} found)[/dim]")
-        console.print("[magenta]" + "─" * 53 + "[/magenta]")
+        console.print(f"\n  [bold #FF6778]● CONFIRMED SECRETS[/bold #FF6778]  [dim #6E6E73]{len(confirmed)} found[/dim #6E6E73]")
+        console.print(f"  [dim #3A3A3C]{'─' * 54}[/dim #3A3A3C]")
         for c in confirmed:
             masked = _mask_for_smart_display(c.finding.secret_value)
             entropy = c.finding.entropy
-            severity = c.finding.severity.upper()
+            sev = c.finding.severity.upper()
             stag = scanner_tag(c.finding)
-            console.print(f"[bold red]REAL[/bold red]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
-            console.print(f"      Value: [bold]{masked}[/bold]  [dim]Entropy: {entropy:.2f}  Severity: {severity}[/dim]")
+            sev_color = "#FF6778" if sev == "HIGH" else ("#FFBA71" if sev == "MEDIUM" else "#6E6E73")
+            console.print(
+                f"  [bold #FF6778]●[/bold #FF6778]  {stag}"
+                f"[bold #8D9FFF]{_loc(c.finding)}[/bold #8D9FFF]  "
+                f"[dim #F5B9EA]{c.finding.rule_id}[/dim #F5B9EA]"
+            )
+            console.print(
+                f"     [dim]value[/dim] [bold]{masked}[/bold]  "
+                f"[dim]entropy {entropy:.2f}  [bold {sev_color}]{sev}[/bold {sev_color}][/dim]"
+            )
             if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
-                console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
-            elif getattr(c.finding, 'scanner', 'gitleaks') == "both":
-                console.print(f"      [green]Auto-confirmed[/green]: detected by both gitleaks and ggshield")
+                console.print(f"     [dim #AA6EEE]↳ {c.reason}[/dim #AA6EEE]")
+            elif getattr(c.finding, "scanner", "gitleaks") == "both":
+                console.print(f"     [dim #30D158]↳ detected by both gitleaks and ggshield[/dim #30D158]")
             console.print()
 
     if false_positives:
-        console.print(f"\n[bold #8D9FFF]  FALSE POSITIVES[/bold #8D9FFF] [dim]({len(false_positives)} skipped)[/dim]")
-        console.print("[#8D9FFF]" + "─" * 53 + "[/#8D9FFF]")
+        console.print(f"  [bold #8D9FFF]○ FALSE POSITIVES[/bold #8D9FFF]  [dim #6E6E73]{len(false_positives)} skipped[/dim #6E6E73]")
+        console.print(f"  [dim #3A3A3C]{'─' * 54}[/dim #3A3A3C]")
         for c in false_positives:
             stag = scanner_tag(c.finding)
-            if "LLM (context-aware):" in c.reason or "LLM classified" in c.reason:
-                console.print(f"[dim]SKIP[/dim]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.finding.rule_id}")
-                console.print(f"      [#8D9FFF]LLM[/#8D9FFF]  {c.reason}")
-            else:
-                console.print(f"[dim]SKIP[/dim]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
+            console.print(
+                f"  [dim #6E6E73]○[/dim #6E6E73]  {stag}"
+                f"[dim #8D9FFF]{_loc(c.finding)}[/dim #8D9FFF]  "
+                f"[dim]{c.finding.rule_id}[/dim]"
+            )
+            console.print(f"     [dim #6E6E73]↳ {c.reason}[/dim #6E6E73]")
+        console.print()
 
     if review_needed:
-        console.print(f"\n[bold yellow]  REVIEW NEEDED[/bold yellow] [dim]({len(review_needed)} items)[/dim]")
-        console.print("[yellow]" + "─" * 53 + "[/yellow]")
+        console.print(f"  [bold #FFBA71]◉ REVIEW NEEDED[/bold #FFBA71]  [dim #6E6E73]{len(review_needed)} items[/dim #6E6E73]")
+        console.print(f"  [dim #3A3A3C]{'─' * 54}[/dim #3A3A3C]")
         for c in review_needed:
             stag = scanner_tag(c.finding)
-            console.print(f"[yellow]WARN[/yellow]  {stag}[#8D9FFF]{c.finding.file}[/#8D9FFF]:{c.finding.line} — {c.reason}")
+            console.print(
+                f"  [bold #FFBA71]◉[/bold #FFBA71]  {stag}"
+                f"[#8D9FFF]{_loc(c.finding)}[/#8D9FFF]  "
+                f"[dim]{c.finding.rule_id}[/dim]"
+            )
+            console.print(f"     [dim #FFBA71]↳ {c.reason}[/dim #FFBA71]")
+        console.print()
 
-    console.print("\n[magenta]" + "─" * 53 + "[/magenta]")
+    # Summary footer with table for actionable findings
+    actionable = confirmed + review_needed
+    if actionable:
+        _format_table([c.finding for c in actionable], title="Findings Summary")
+
+    console.print()
     console.print(
-        f"  [bold red]{len(confirmed)} confirmed[/bold red]"
-        f"  [dim]·[/dim]  "
+        f"  [bold #FF6778]{len(confirmed)} confirmed[/bold #FF6778]"
+        f"  [dim #6E6E73]·[/dim #6E6E73]  "
         f"[#8D9FFF]{len(false_positives)} skipped[/#8D9FFF]"
-        f"  [dim]·[/dim]  "
-        f"[yellow]{len(review_needed)} needs review[/yellow]"
-        f"  [dim]·[/dim]  [magenta]leakfix[/magenta]"
+        f"  [dim #6E6E73]·[/dim #6E6E73]  "
+        f"[#FFBA71]{len(review_needed)} needs review[/#FFBA71]"
+        f"  [dim #6E6E73]·[/dim #6E6E73]  [bold #BC82F3]leakfix[/bold #BC82F3]"
     )
 
 
