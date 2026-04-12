@@ -373,6 +373,13 @@ def main():
 
 
 @main.command()
+def ui():
+    """Interactive TUI wizard (Apple Intelligence style)."""
+    from leakfix.wizard_app import LeakfixWizardApp
+    LeakfixWizardApp().run()
+
+
+@main.command()
 @click.option(
     "--llm",
     is_flag=True,

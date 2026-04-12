@@ -307,10 +307,10 @@ class OptionList(Widget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ShimmerHeader(Static):
-    """Animated Apple Intelligence header panel with left-aligned content."""
+    """Animated Apple Intelligence header — Claude Code terminal style, left-aligned."""
     can_focus = False
     frame: reactive[int] = reactive(0)
-    
+
     def __init__(
         self,
         title: str = "Setup",
@@ -320,27 +320,29 @@ class ShimmerHeader(Static):
         super().__init__(**kwargs)
         self._title = title
         self._subtitle = subtitle
-    
+
     def on_mount(self) -> None:
         self.set_interval(1 / 20, self._tick)
-    
+
     def _tick(self) -> None:
         self.frame += 1
         self.refresh(layout=False)
-    
+
     def render(self) -> RenderableType:
         frame = self.frame  # MUST be first line for reactive tracking
-        
-        # Update border color via styles
-        self.styles.border = ("heavy", _border_color(frame))
-        
-        # Return just the text content - no Panel wrapper
-        result = Text()
-        result.append_text(_make_shimmer_title(f"◆  leakfix  ◆  {self._title}", frame))
-        result.append("\n")
-        result.append(self._subtitle, style=APPLE_DIM)
-        
-        return result
+
+        # Animate bottom border color
+        self.styles.border_bottom = ("heavy", _border_color(frame))
+
+        # Left-aligned shimmer title (leading spaces via the string itself)
+        shimmer = _make_shimmer_title(f"  ◆  leakfix  ◆  {self._title}", frame)
+        shimmer.justify = "left"
+
+        # Subtitle line
+        sub = Text(f"  {self._subtitle}", style=APPLE_DIM, justify="left")
+
+        from rich.console import Group
+        return Group(shimmer, sub)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -389,16 +391,14 @@ VerticalScroll {
 }
 
 ShimmerHeader {
-    width: 60%;
-    content-align: center middle;
-    height: 7;
-    background: #2C2C2E;
-    border: heavy #BC82F3;
-    padding: 1 4;
-    margin: 0 0 1 0;
-    align: center middle;
-    text-align: center;
-    content-align: center middle;
+    width: 100%;
+    height: 5;
+    background: #1C1C1E;
+    border-bottom: heavy #BC82F3;
+    padding: 1 2;
+    margin: 0;
+    text-align: left;
+    content-align: left middle;
     dock: top;
 }
 
@@ -408,6 +408,7 @@ ShimmerHeader {
     height: 1fr;
     overflow-y: auto;
     overflow-x: hidden;
+    align: left top;
     &:focus { background: #1C1C1E; }
 }
 
