@@ -62,7 +62,7 @@ def _validate_model_name(name: str) -> str | None:
     if not name.strip():
         return "Model name cannot be empty"
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*(:[\w.-]+)?$', name.strip()):
-        return "Invalid format. Use: modelname or modelname:tag (e.g. qwen3:0.6b)"
+        return "Invalid format. Use: modelname or modelname:tag (e.g. qwen2.5-coder:3b)"
     return None
 
 
@@ -350,9 +350,10 @@ class ShimmerHeader(Static):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LLM_MODELS = [
-    ("qwen3:0.6b", "fastest, 2GB RAM", True),
+    ("qwen2.5-coder:3b", "recommended, 2GB RAM, code-optimised", True),
+    ("qwen3:0.6b", "fastest, 2GB RAM", False),
     ("llama3.2:3b", "balanced, 4GB RAM", False),
-    ("phi4", "best quality, 10GB RAM", False),
+    ("qwen3-coder:30b", "best quality, 20GB RAM", False),
 ]
 
 
@@ -885,7 +886,7 @@ Label {
         panel.mount(NFStatic("  Format: modelname or modelname:tag", classes="hint-text"))
         
         panel.mount(NFLabel("  Model name:"))
-        panel.mount(Input(placeholder="e.g. qwen3:0.6b", id="custom-model-input"))
+        panel.mount(Input(placeholder="e.g. qwen2.5-coder:3b", id="custom-model-input"))
         
         # Placeholder for validation error
         self._validation_error_widget = NFStatic("", classes="error-text", id="validation-error")

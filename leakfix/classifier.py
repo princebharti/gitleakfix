@@ -665,7 +665,7 @@ Reason: File is .env.example and surrounding lines show other placeholder values
 
         config = load_config()
         provider = config.get("llm_provider", "ollama")
-        model = config.get("llm_model") or "qwen3:0.6b"
+        model = config.get("llm_model") or "qwen2.5-coder:3b"
 
         context_lines = self._load_context_lines(finding, window=15)
         file_header = self._load_file_header(finding, n=5)

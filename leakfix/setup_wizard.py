@@ -19,9 +19,10 @@ DEFAULT_CONFIG = {
 }
 
 LLM_MODELS = [
-    ("qwen3:0.6b", "fastest, 2GB RAM", True),
+    ("qwen2.5-coder:3b", "recommended, 2GB RAM, code-optimised", True),
+    ("qwen3:0.6b", "fastest, 2GB RAM", False),
     ("llama3.2:3b", "balanced, 4GB RAM", False),
-    ("phi4", "best quality, 10GB RAM", False),
+    ("qwen3-coder:30b", "best quality, 20GB RAM", False),
 ]
 
 
@@ -216,7 +217,7 @@ def _ask_llm_change(config: dict) -> bool:
 
 def _ask_model_choice() -> str:
     """Ask user to select model. Returns model name."""
-    print("\nSelect model (recommended: qwen3:0.6b):")
+    print("\nSelect model (recommended: qwen2.5-coder:3b):")
     for i, (model, desc, recommended) in enumerate(LLM_MODELS, 1):
         rec = "  ← recommended" if recommended else ""
         print(f"  {i}. {model}   — {desc}{rec}")
